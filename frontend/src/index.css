@@ -1,0 +1,254 @@
+/* ──────────────── Instant Paint (prevents flash) ──────────────── */
+html,
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+/* ──────────────── Core Tailwind Layers ──────────────── */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ──────────────── Base Layout Reset ──────────────── */
+/* ✅ UPDATED: Scroll-safe reset */
+html,
+body {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+
+  /* ✅ Allow natural page scrolling */
+  overflow-y: auto;
+}
+
+#root {
+  width: 100%;
+
+  /* ✅ Prevent page cutoff while keeping layout identical */
+  min-height: 100vh;
+}
+
+/* ──────────────── Typography & Rendering Defaults ──────────────── */
+:root {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Avenir, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ──────────────── Theme Variables ──────────────── */
+@layer base {
+  :root {
+    /* Light Mode */
+    --background: 0 0% 99%;
+    --foreground: 0 0% 8%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 8%;
+    --primary: 210 6% 12%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 10%;
+    --muted: 0 0% 95%;
+    --muted-foreground: 0 0% 40%;
+    --accent: 210 8% 94%;
+    --accent-foreground: 0 0% 8%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 88%;
+    --input: 0 0% 88%;
+    --ring: 210 8% 20%;
+    --radius: 0.5rem;
+
+    /* Accent palette */
+    --chart-1: 200 70% 55%;
+    --chart-2: 170 60% 45%;
+    --chart-3: 40 85% 55%;
+    --chart-4: 300 65% 60%;
+    --chart-5: 350 70% 55%;
+  }
+
+  .dark {
+    /* Dark Mode */
+    --background: 144 43% 0.7%;
+    --foreground: 210 10% 90%;
+    --card: 144 43% 1.2%;
+    --card-foreground: 0 0% 96%;
+    --popover: 120 100% 2%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 210 6% 94%;
+    --primary-foreground: 0 0% 10%;
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 0 0% 14%;
+    --muted-foreground: 0 0% 64%;
+    --accent: 210 8% 20%;
+    --accent-foreground: 0 0% 96%;
+    --destructive: 0 63% 38%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 120 100% 1.5%;
+    --input: 0 0% 18%;
+    --ring: 210 10% 70%;
+
+    /* Accent palette */
+    --chart-1: 210 70% 60%;
+    --chart-2: 160 55% 45%;
+    --chart-3: 40 85% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 70% 55%;
+  }
+}
+
+/* ──────────────── Tailwind Reset & Base Layer ──────────────── */
+@layer base {
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+
+    /* ✅ UPDATED: Fix flex scroll freezing */
+    min-height: 0;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: inherit;
+    margin: 0;
+    padding: 0;
+    display: block;
+    min-width: 320px;
+    /* disable transitions on first render to prevent flicker */
+    transition: none;
+  }
+
+  html.dark body.loaded {
+    transition:
+      background-color 0.3s ease,
+      color 0.3s ease,
+      border-color 0.3s ease;
+  }
+
+  /* Scrollbar refinement */
+  ::-webkit-scrollbar {
+    width: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.4);
+    border-radius: 10px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.7);
+  }
+}
+
+/* ──────────────── Interactive Elements ──────────────── */
+a {
+  color: hsl(var(--primary));
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+a:hover {
+  color: hsl(var(--primary) / 0.8);
+  text-decoration: none;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius);
+  transition:
+    all 0.25s ease,
+    transform 0.1s ease;
+}
+button:hover {
+  transform: translateY(-1px);
+}
+button:active {
+  transform: translateY(0);
+}
+
+/* ──────────────── Color Scheme Sync ──────────────── */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+  }
+}
+
+[data-radix-tooltip-content] {
+  background: transparent !important;
+  color: inherit !important;
+  box-shadow: none !important;
+}
+
+/* =========================
+   🔔 Bell ring
+========================= */
+@keyframes bellShake {
+  0% { transform: rotate(0); }
+  10% { transform: rotate(15deg); }
+  20% { transform: rotate(-15deg); }
+  30% { transform: rotate(12deg); }
+  40% { transform: rotate(-12deg); }
+  50% { transform: rotate(8deg); }
+  60% { transform: rotate(-8deg); }
+  70% { transform: rotate(4deg); }
+  80% { transform: rotate(-4deg); }
+  90% { transform: rotate(2deg); }
+  100% { transform: rotate(0); }
+}
+
+.animate-bell {
+  animation: bellShake 0.65s ease-in-out infinite;
+  transform-origin: top center;
+}
+
+/* =========================
+   🔴 Badge pop-in
+========================= */
+@keyframes badgePop {
+  0% { transform: scale(0.6); opacity: 0; }
+  60% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.animate-badge-pop {
+  animation: badgePop 240ms ease-out;
+}
+
+/* =========================
+   🔴 Badge pulse (heartbeat)
+========================= */
+@keyframes badgePulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
+
+.animate-badge-pulse {
+  animation: badgePulse 1.2s ease-in-out infinite;
+}
+
+/* =========================
+   🔴 Soft ping behind badge
+========================= */
+@keyframes notifPing {
+  0% { transform: scale(1); opacity: 0.35; }
+  70% { transform: scale(2.1); opacity: 0; }
+  100% { transform: scale(2.1); opacity: 0; }
+}
+
+.animate-notif-ping {
+  animation: notifPing 1.4s ease-out infinite;
+}
