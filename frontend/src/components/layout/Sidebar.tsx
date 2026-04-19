@@ -30,7 +30,7 @@ const menuGroups: MenuGroup[] = [
   },
   {
     title: "Settings",
-    items: [{ label: "Account", icon: Settings, href: "/dashboard" }],
+    items: [{ label: "Account", icon: Settings, href: "/account" }],
   },
 ];
 

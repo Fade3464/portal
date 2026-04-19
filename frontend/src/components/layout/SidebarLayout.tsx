@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Outlet, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { ElasticScroll } from "@/components/ElasticScroll";
 import Sidebar from "@/components/layout/Sidebar";
@@ -16,6 +16,7 @@ export default function SidebarLayout() {
   const [loading, setLoading] = useState(true);
 
   const navigate = useNavigate();
+  const location = useLocation();
 
   useEffect(() => {
     const saved = localStorage.getItem("sidebarCollapsed");
@@ -39,7 +40,7 @@ export default function SidebarLayout() {
           throw new Error("Unauthorized");
         }
 
-        setUsername(data?.user?.username || null);
+        setUsername(data?.user?.display_name || data?.user?.username || null);
         setEmail(data?.user?.email || null);
       } catch {
         if (!active) {
@@ -64,6 +65,37 @@ export default function SidebarLayout() {
     };
   }, [navigate]);
 
+  useEffect(() => {
+    const handleAccountUpdated = (
+      event: Event
+    ) => {
+      const detail = (event as CustomEvent<{
+        display_name?: string;
+        email?: string;
+      }>).detail;
+
+      if (detail?.display_name) {
+        setUsername(detail.display_name);
+      }
+      if (detail?.email) {
+        setEmail(detail.email);
+      }
+    };
+
+    window.addEventListener("account-profile-updated", handleAccountUpdated);
+    return () => {
+      window.removeEventListener("account-profile-updated", handleAccountUpdated);
+    };
+  }, []);
+
+  const headerTitle = useMemo(() => {
+    if (location.pathname.startsWith("/account")) {
+      return "Account";
+    }
+
+    return "Dashboard";
+  }, [location.pathname]);
+
   if (loading || !sidebarReady) {
     return (
       <div className="flex min-h-screen items-center justify-center">
@@ -87,7 +119,7 @@ export default function SidebarLayout() {
       />
 
       <div className="flex flex-1 flex-col overflow-hidden">
-        <Header collapsed={collapsed} title="Dashboard" />
+        <Header collapsed={collapsed} title={headerTitle} />
 
         <div
           className={cn(

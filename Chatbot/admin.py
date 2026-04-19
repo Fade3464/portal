@@ -36,6 +36,7 @@ class CallLogAdmin(admin.ModelAdmin):
         "flow",
         "batch",
         "duration",
+        "call_recording_link",
         "created_at",
     )
     list_filter = ("status", "state", "created_at")
@@ -50,6 +51,11 @@ class BlacklistedNumbersAdmin(admin.ModelAdmin):
 
 @admin.register(RESTAPITOKENS)
 class RESTAPITOKENSAdmin(admin.ModelAdmin):
-    list_display = ("token", "is_active", "created_at")
+    list_display = ("masked_token", "is_active", "created_at")
     list_filter = ("is_active", "created_at")
     search_fields = ("token",)
+    readonly_fields = ("created_at",)
+
+    @admin.display(description="Token")
+    def masked_token(self, obj):
+        return obj.masked_token

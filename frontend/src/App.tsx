@@ -7,6 +7,7 @@ import ProtectedRoute from "./components/ProtectedRoute";
 import { SpinnerCustom } from "./components/ui/spinner";
 import { ThemeProvider } from "./context/ThemeProvider";
 import AuthPage from "./pages/AuthPage";
+import AccountPage from "./pages/AccountPage";
 import Dashboard from "./pages/Dashboard";
 
 function RootRedirect() {
@@ -72,6 +73,7 @@ function AppRoutes() {
         }
       >
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/account" element={<AccountPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

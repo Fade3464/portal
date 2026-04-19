@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { SpinnerCustom } from "@/components/ui/spinner";
+import { getCsrfToken } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 
 const formSchema = z.object({
@@ -46,9 +47,21 @@ export function UserAuthForm({
     setIsLoading(true);
 
     try {
+      let csrfToken = getCsrfToken();
+
+      if (!csrfToken) {
+        await fetch("/api/check-auth/", {
+          credentials: "include",
+        });
+        csrfToken = getCsrfToken();
+      }
+
       const res = await fetch("/api/login/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken,
+        },
         credentials: "include",
         body: JSON.stringify(data),
       });

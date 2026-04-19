@@ -9,6 +9,7 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { LogOut, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { getCsrfToken } from "@/lib/csrf";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 
@@ -26,6 +27,9 @@ export default function UserDropdown({
   const handleLogout = async () => {
     const res = await fetch("/api/logout/", {
       method: "POST",
+      headers: {
+        "X-CSRFToken": getCsrfToken(),
+      },
       credentials: "include",
     });
     if (res.ok) {
@@ -69,7 +73,7 @@ export default function UserDropdown({
       <DropdownMenuContent className="w-56" align="start">
         <DropdownMenuLabel>My Account</DropdownMenuLabel>
 
-        <DropdownMenuItem onClick={() => navigate("/dashboard")}>
+        <DropdownMenuItem onClick={() => navigate("/account")}>
           <Settings className="h-4 w-4 mr-2" />
           Account
         </DropdownMenuItem>

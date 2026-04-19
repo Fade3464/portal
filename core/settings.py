@@ -1,6 +1,8 @@
 
-from pathlib import Path
 import os
+from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -10,16 +12,31 @@ if env_path.exists():
     load_dotenv(env_path)
 
 
+def _get_bool_env(name, default=False):
+    return os.getenv(name, str(default)).strip().lower() == "true"
+
+
+def _get_list_env(name, default=""):
+    raw_value = os.getenv(name, default)
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-replace-me")
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv("DEBUG", "False").strip().lower() == "true"
+DEBUG = _get_bool_env("DEBUG", False)
 
-ALLOWED_HOSTS = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "").split(",") if host.strip()]
-PROD = os.getenv("PROD", "False").strip().lower() == "true"
+ALLOWED_HOSTS = _get_list_env("ALLOWED_HOSTS")
+PROD = _get_bool_env("PROD", False)
+
+if PROD and SECRET_KEY == "django-insecure-replace-me":
+    raise ImproperlyConfigured("SECRET_KEY must be set in production.")
+
+if PROD and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured("ALLOWED_HOSTS must be configured in production.")
 # Application definition
 
 INSTALLED_APPS = [
@@ -71,7 +88,6 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
-        "rest_framework.authentication.BasicAuthentication",
     ],
 }
 # Database
@@ -83,6 +99,7 @@ DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = os.getenv("DB_PORT", "")
+DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "60"))
 
 DATABASES = {
     'default': {
@@ -92,6 +109,7 @@ DATABASES = {
         'PASSWORD': DB_PASSWORD,
         'HOST': DB_HOST,
         'PORT': DB_PORT,
+        'CONN_MAX_AGE': DB_CONN_MAX_AGE,
     }
 }
 
@@ -140,13 +158,33 @@ MEDIA_ROOT = BASE_DIR / "media"
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
-CSRF_TRUSTED_ORIGINS = [
-    "http://127.0.0.1:5173"
-]
-
+CORS_ALLOWED_ORIGINS = _get_list_env(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+)
+CSRF_TRUSTED_ORIGINS = _get_list_env(
+    "CSRF_TRUSTED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+)
 CORS_ALLOW_CREDENTIALS = True
+
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = PROD
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SECURE = PROD
+CSRF_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_HTTPONLY = False
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
+
+USE_X_FORWARDED_HOST = PROD
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if PROD else None
+SECURE_SSL_REDIRECT = PROD and _get_bool_env("SECURE_SSL_REDIRECT", True)
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "31536000")) if PROD else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = PROD and _get_bool_env(
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS",
+    True,
+)
+SECURE_HSTS_PRELOAD = PROD and _get_bool_env("SECURE_HSTS_PRELOAD", True)

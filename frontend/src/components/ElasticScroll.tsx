@@ -48,6 +48,35 @@ export function ElasticScroll({
 
     const clamp = (v: number, min: number, max: number) =>
       Math.max(min, Math.min(max, v))
+    const canNestedScroll = (target: EventTarget | null, deltaY: number) => {
+      if (!(target instanceof HTMLElement)) {
+        return false
+      }
+
+      let current: HTMLElement | null = target
+
+      while (current && current !== el) {
+        const style = window.getComputedStyle(current)
+        const overflowY = style.overflowY
+        const isScrollable =
+          (overflowY === "auto" || overflowY === "scroll") &&
+          current.scrollHeight > current.clientHeight
+
+        if (isScrollable) {
+          const canScrollUp = current.scrollTop > 0
+          const canScrollDown =
+            Math.ceil(current.scrollTop + current.clientHeight) < current.scrollHeight
+
+          if ((deltaY < 0 && canScrollUp) || (deltaY > 0 && canScrollDown)) {
+            return true
+          }
+        }
+
+        current = current.parentElement
+      }
+
+      return false
+    }
     const applyResistance = (current: number, nextDelta: number) => {
       const distance = Math.abs(current)
       const t = clamp(distance / maxPull, 0, 1)
@@ -66,6 +95,10 @@ export function ElasticScroll({
     }
 
     const onWheel = (e: WheelEvent) => {
+      if (canNestedScroll(e.target, e.deltaY)) {
+        return
+      }
+
       const atTop = el.scrollTop <= 0
       const atBottom =
         Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight

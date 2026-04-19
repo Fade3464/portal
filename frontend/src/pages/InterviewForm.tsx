@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/popover";
 import { Calendar } from "@/components/ui/calendar";
 import { toast } from "sonner";
+import { getCsrfToken } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 import { useNavigate } from "react-router-dom";
 
@@ -187,6 +188,9 @@ export default function InterviewForm() {
     try {
       const res = await fetch("/api/logout/", {
         method: "POST",
+        headers: {
+          "X-CSRFToken": getCsrfToken(),
+        },
         credentials: "include",
       });
       if (res.ok) {

@@ -5,16 +5,24 @@ from pathlib import Path
 
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.core.exceptions import ValidationError
-from django.db.models import Count
+from django.core.validators import URLValidator, validate_email
+from django.db.models import Avg, Count, Sum
 from django.http import JsonResponse
+from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from .models import BlacklistedNumbers, CallLog, Dialer, RESTAPITOKENS
 
 AREA_CODES_CSV_PATH = Path("/home/kali/new1.2/assets/us_area_codes.csv")
+url_validator = URLValidator()
+
+
+def _get_user_display_name(user):
+    full_name = f"{user.first_name} {user.last_name}".strip()
+    return full_name or user.get_username()
 
 
 def _json_error(message, status=400):
@@ -64,12 +72,99 @@ def _resolve_dialer(payload):
     dialer_name = (payload.get("dialer_name") or "").strip()
 
     if dialer_id is not None:
-        return Dialer.objects.filter(id=dialer_id).first()
+        return Dialer.objects.only("id", "dialer_name", "flow", "batch").filter(id=dialer_id).first()
 
     if dialer_name:
-        return Dialer.objects.filter(dialer_name__iexact=dialer_name).order_by("id").first()
+        return (
+            Dialer.objects.only("id", "dialer_name", "flow", "batch")
+            .filter(dialer_name__iexact=dialer_name)
+            .order_by("id")
+            .first()
+        )
 
     return None
+
+
+def _normalize_int(value, field_name, minimum=None, maximum=None):
+    if value is None or value == "":
+        return None
+
+    try:
+        normalized_value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer.")
+
+    if minimum is not None and normalized_value < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+
+    if maximum is not None and normalized_value > maximum:
+        raise ValueError(f"{field_name} must be at most {maximum}.")
+
+    return normalized_value
+
+
+def _normalize_optional_string(value, field_name, max_length):
+    if value is None:
+        return None
+
+    normalized_value = str(value).strip()
+    if len(normalized_value) > max_length:
+        raise ValueError(f"{field_name} must be {max_length} characters or fewer.")
+
+    return normalized_value
+
+
+def _normalize_required_string(value, field_name, max_length):
+    normalized_value = _normalize_optional_string(value, field_name, max_length)
+    if not normalized_value:
+        raise ValueError(f"{field_name} is required.")
+    return normalized_value
+
+
+def _normalize_recording_link(value):
+    if value in (None, ""):
+        return None
+
+    normalized_value = str(value).strip()
+    if len(normalized_value) > 1000:
+        raise ValueError("call_recording_link must be 1000 characters or fewer.")
+
+    try:
+        url_validator(normalized_value)
+    except ValidationError as exc:
+        raise ValueError("call_recording_link must be a valid URL.") from exc
+
+    return normalized_value
+
+
+def _validate_call_log_payload(payload, *, require_status=False):
+    normalized = {}
+
+    if "call_id" in payload or require_status:
+        normalized["call_id"] = _normalize_int(
+            payload.get("call_id"),
+            "call_id",
+            minimum=1_000_000_000,
+            maximum=9_999_999_999,
+        )
+
+    if require_status or "status" in payload:
+        status_value = _normalize_required_string(payload.get("status"), "status", 255)
+        normalized["status"] = status_value
+
+    if "duration" in payload or require_status:
+        duration_value = payload.get("duration", 0 if require_status else None)
+        normalized["duration"] = _normalize_int(duration_value, "duration", minimum=0)
+
+    if "state" in payload:
+        normalized["state"] = _normalize_optional_string(payload.get("state"), "state", 255)
+
+    if "call_recording_link" in payload or require_status:
+        normalized["call_recording_link"] = _normalize_recording_link(
+            payload.get("call_recording_link")
+        )
+
+    return normalized
 
 
 @lru_cache(maxsize=1)
@@ -116,6 +211,7 @@ def _serialize_call_log(call_log):
         "flow": call_log.flow,
         "batch": call_log.batch,
         "duration": call_log.duration,
+        "call_recording_link": call_log.call_recording_link,
         "created_at": call_log.created_at.isoformat(),
     }
 
@@ -157,7 +253,36 @@ def _get_today_range():
     return start_of_day, end_of_day
 
 
-@csrf_exempt
+def _serialize_account_profile(client):
+    user = client.user
+    return {
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "display_name": _get_user_display_name(user),
+        "username": user.get_username(),
+        "email": user.email,
+        "backup_email": client.backup_email,
+        "client_name": client.client_name,
+    }
+
+
+def _normalize_email(value, field_name, *, required=False):
+    normalized_value = _normalize_optional_string(value, field_name, 254)
+    if required and not normalized_value:
+        raise ValueError(f"{field_name} is required.")
+
+    if not normalized_value:
+        return ""
+
+    normalized_value = normalized_value.lower()
+
+    try:
+        validate_email(normalized_value)
+    except ValidationError as exc:
+        raise ValueError(f"{field_name} must be a valid email address.") from exc
+
+    return normalized_value
+
 @require_POST
 def login_view(request):
     try:
@@ -190,36 +315,156 @@ def login_view(request):
             "user": {
                 "id": user.id,
                 "username": user.get_username(),
+                "display_name": _get_user_display_name(user),
                 "email": user.email,
             },
         }
     )
 
 
-@csrf_exempt
 @require_POST
 def logout_view(request):
     logout(request)
     return _json_response({"message": "Logout successful."})
 
 
+@ensure_csrf_cookie
 @require_GET
 def check_auth_view(request):
     user = request.user
 
     if not user.is_authenticated:
-        return _json_response({"is_authenticated": False}, status=401)
+        response = _json_response({"is_authenticated": False}, status=401)
+        get_token(request)
+        return response
 
-    return _json_response(
+    response = _json_response(
         {
             "is_authenticated": True,
             "user": {
                 "id": user.id,
                 "username": user.get_username(),
+                "display_name": _get_user_display_name(user),
                 "email": user.email,
             },
         }
     )
+    get_token(request)
+    return response
+
+
+@require_http_methods(["GET", "PATCH"])
+def account_profile_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    if request.method == "GET":
+        return _json_response({"profile": _serialize_account_profile(client)})
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    user = client.user
+    User = get_user_model()
+    current_password = payload.get("current_password") or ""
+
+    try:
+        first_name = _normalize_optional_string(payload.get("first_name"), "first_name", 150)
+        last_name = _normalize_optional_string(payload.get("last_name"), "last_name", 150)
+        email = _normalize_email(payload.get("email"), "email", required=True)
+        backup_email = _normalize_email(payload.get("backup_email"), "backup_email")
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    if not current_password:
+        return _json_error("Current password is required to save changes.", status=400)
+
+    if not user.check_password(current_password):
+        return _json_error("Current password is incorrect.", status=400)
+
+    email_exists = (
+        User.objects.filter(email__iexact=email)
+        .exclude(pk=user.pk)
+        .exists()
+    )
+    if email_exists:
+        return _json_error("This email is already in use.", status=409)
+
+    user.first_name = first_name or ""
+    user.last_name = last_name or ""
+    user.email = email
+    user.save(update_fields=["first_name", "last_name", "email"])
+
+    client.backup_email = backup_email
+    client.save(update_fields=["backup_email"])
+
+    return _json_response(
+        {
+            "message": "Account details updated successfully.",
+            "profile": _serialize_account_profile(client),
+        }
+    )
+
+
+@require_POST
+def account_password_verify_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    current_password = payload.get("current_password") or ""
+    if not current_password:
+        return _json_error("Current password is required.", status=400)
+
+    if not client.user.check_password(current_password):
+        return _json_error("Current password is incorrect.", status=400)
+
+    return _json_response({"message": "Current password verified."})
+
+
+@require_POST
+def account_password_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    current_password = payload.get("current_password") or ""
+    new_password = payload.get("new_password") or ""
+    confirm_password = payload.get("confirm_password") or ""
+
+    if not current_password or not new_password or not confirm_password:
+        return _json_error("All password fields are required.", status=400)
+
+    if not client.user.check_password(current_password):
+        return _json_error("Current password is incorrect.", status=400)
+
+    if new_password != confirm_password:
+        return _json_error("New password and confirmation do not match.", status=400)
+
+    if len(new_password) < 8:
+        return _json_error("New password must be at least 8 characters long.", status=400)
+
+    if new_password == current_password:
+        return _json_error("New password must be different from the current password.", status=400)
+
+    client.user.set_password(new_password)
+    client.user.save(update_fields=["password"])
+    login(request, client.user)
+
+    return _json_response({"message": "Password updated successfully."})
 
 
 @csrf_exempt
@@ -239,22 +484,22 @@ def create_call_log_view(request):
         return _json_error("A valid dialer_id or dialer_name is required.")
 
     try:
-        resolved_call_id = payload.get("call_id")
-        resolved_state = payload.get("state")
+        normalized_fields = _validate_call_log_payload(payload, require_status=True)
+        resolved_call_id = normalized_fields["call_id"]
+        resolved_state = normalized_fields.get("state")
         if resolved_state is None:
             resolved_state = _derive_state_from_call_id(resolved_call_id)
 
-        call_log = CallLog(
+        call_log = CallLog.objects.create(
             call_id=resolved_call_id,
             dialer=dialer,
-            status=(payload.get("status") or "").strip(),
+            status=normalized_fields["status"],
             state=resolved_state,
-            duration=payload.get("duration", 0),
+            duration=normalized_fields["duration"],
+            call_recording_link=normalized_fields.get("call_recording_link"),
         )
-        call_log.full_clean()
-        call_log.save()
-    except ValidationError as exc:
-        return _json_response({"errors": exc.message_dict}, status=400)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
 
     return _json_response(
         {
@@ -278,39 +523,52 @@ def update_call_log_view(request, call_uuid):
         return _json_error(str(exc))
 
     call_log = (
-        CallLog.objects.filter(call_uuid=call_uuid)
-        .select_related("dialer")
-        .order_by("-created_at", "-id")
+        CallLog.objects.select_related("dialer")
+        .filter(call_uuid=call_uuid)
         .first()
     )
     if call_log is None:
         return _json_error("No call log found for the provided call_uuid.", status=404)
+
+    try:
+        normalized_fields = _validate_call_log_payload(payload, require_status=False)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    update_fields = []
 
     if "dialer_id" in payload or "dialer_name" in payload:
         dialer = _resolve_dialer(payload)
         if dialer is None:
             return _json_error("A valid dialer_id or dialer_name is required.")
         call_log.dialer = dialer
+        update_fields.append("dialer")
 
-    if "call_id" in payload:
-        call_log.call_id = payload.get("call_id")
+    if "call_id" in normalized_fields:
+        call_log.call_id = normalized_fields["call_id"]
+        update_fields.append("call_id")
 
-    if "status" in payload:
-        call_log.status = payload.get("status")
+    if "status" in normalized_fields:
+        call_log.status = normalized_fields["status"]
+        update_fields.append("status")
 
-    if "duration" in payload:
-        call_log.duration = payload.get("duration")
+    if "duration" in normalized_fields:
+        call_log.duration = normalized_fields["duration"]
+        update_fields.append("duration")
 
-    if "state" in payload:
-        call_log.state = payload.get("state")
-    elif "call_id" in payload:
+    if "call_recording_link" in normalized_fields:
+        call_log.call_recording_link = normalized_fields["call_recording_link"]
+        update_fields.append("call_recording_link")
+
+    if "state" in normalized_fields:
+        call_log.state = normalized_fields["state"]
+        update_fields.append("state")
+    elif "call_id" in normalized_fields:
         call_log.state = _derive_state_from_call_id(call_log.call_id)
+        update_fields.append("state")
 
-    try:
-        call_log.full_clean()
-        call_log.save()
-    except ValidationError as exc:
-        return _json_response({"errors": exc.message_dict}, status=400)
+    if update_fields:
+        call_log.save(update_fields=update_fields)
 
     return _json_response(
         {
@@ -350,14 +608,29 @@ def dashboard_filters_view(request):
     )
 
     selected_dialer_id = request.GET.get("dialer_id")
+    table_selected_statuses = [
+        status.strip()
+        for status in request.GET.getlist("table_status")
+        if status and status.strip()
+    ]
     date_from = request.GET.get("date_from")
     date_to = request.GET.get("date_to")
+    page = request.GET.get("page", "1")
+    page_size = request.GET.get("page_size", "10")
 
     try:
         start_at = _normalize_datetime_param(date_from)
         end_at = _normalize_datetime_param(date_to)
+        page_number = int(page)
+        page_size_number = int(page_size)
     except ValueError as exc:
         return _json_error(str(exc), status=400)
+
+    if page_number < 1:
+        return _json_error("page must be a positive integer.", status=400)
+
+    if page_size_number < 1 or page_size_number > 100:
+        return _json_error("page_size must be between 1 and 100.", status=400)
 
     if start_at is None and end_at is None:
         start_at, end_at = _get_today_range()
@@ -368,7 +641,7 @@ def dashboard_filters_view(request):
     filtered_logs = CallLog.objects.filter(
         dialer__client=client,
         dialer__active=True,
-    ).select_related("dialer")
+    )
 
     normalized_dialer_id = None
     selected_dialer = None
@@ -399,7 +672,32 @@ def dashboard_filters_view(request):
         filtered_logs = filtered_logs.filter(created_at__lte=end_at)
 
     total_count = filtered_logs.count()
-    recent_logs = list(filtered_logs.order_by("-created_at", "-id")[:50])
+    table_logs = filtered_logs
+    if table_selected_statuses:
+        table_logs = table_logs.filter(status__in=table_selected_statuses)
+
+    duration_summary = filtered_logs.aggregate(
+        avg_duration=Avg("duration"),
+        total_duration=Sum("duration"),
+    )
+    status_summary_rows = list(
+        filtered_logs.values("status")
+        .annotate(count=Count("id"))
+        .order_by("-count", "status")
+    )
+    status_matrix_rows = list(
+        filtered_logs.values("dialer__id", "dialer__dialer_name", "status")
+        .annotate(count=Count("id"))
+        .order_by("dialer__dialer_name", "status")
+    )
+    table_total_count = table_logs.count()
+    total_pages = max((table_total_count + page_size_number - 1) // page_size_number, 1)
+    effective_page = min(page_number, total_pages)
+    offset = (effective_page - 1) * page_size_number
+    paginated_logs = list(
+        table_logs.select_related("dialer")
+        .order_by("-created_at", "-id")[offset : offset + page_size_number]
+    )
     chart_records = list(
         filtered_logs.order_by("created_at", "id").values("created_at", "status")
     )
@@ -463,18 +761,72 @@ def dashboard_filters_view(request):
             }
         )
 
+    matrix_statuses = [
+        row["status"] or "unknown"
+        for row in status_summary_rows
+    ]
+    status_matrix_lookup = {}
+    for row in status_matrix_rows:
+        dialer_id = row["dialer__id"]
+        dialer_name = row["dialer__dialer_name"]
+        status_name = row["status"] or "unknown"
+        count = row["count"]
+
+        if dialer_id not in status_matrix_lookup:
+            status_matrix_lookup[dialer_id] = {
+                "dialer_id": dialer_id,
+                "dialer_name": dialer_name,
+                "total_calls": 0,
+                "status_counts": {},
+            }
+
+        dialer_row = status_matrix_lookup[dialer_id]
+        dialer_row["total_calls"] += count
+        dialer_row["status_counts"][status_name] = count
+
+    status_matrix = []
+    for dialer_row in status_matrix_lookup.values():
+        total_calls_for_row = dialer_row["total_calls"]
+        status_matrix.append(
+            {
+                "dialer_id": dialer_row["dialer_id"],
+                "dialer_name": dialer_row["dialer_name"],
+                "total_calls": total_calls_for_row,
+                "status_percentages": {
+                    status_name: {
+                        "count": dialer_row["status_counts"].get(status_name, 0),
+                        "percentage": (
+                            dialer_row["status_counts"].get(status_name, 0) / total_calls_for_row * 100
+                        )
+                        if total_calls_for_row
+                        else 0,
+                    }
+                    for status_name in matrix_statuses
+                },
+            }
+        )
+
+    status_matrix.sort(key=lambda row: row["dialer_name"].lower())
+
     return _json_response(
         {
             "dialers": active_dialers,
             "filters": {
                 "dialer_id": normalized_dialer_id,
                 "dialer_name": selected_dialer.dialer_name if selected_dialer else "All",
+                "table_statuses": table_selected_statuses,
                 "date_from": start_at.isoformat() if start_at else None,
                 "date_to": end_at.isoformat() if end_at else None,
             },
             "results": {
                 "total_count": total_count,
-                "records": [_serialize_call_log(call_log) for call_log in recent_logs],
+                "records": [_serialize_call_log(call_log) for call_log in paginated_logs],
+                "pagination": {
+                    "page": effective_page,
+                    "page_size": page_size_number,
+                    "total_pages": total_pages,
+                    "total_records": table_total_count,
+                },
                 "chart_records": [
                     {
                         "created_at": timezone.localtime(record["created_at"]).isoformat(),
@@ -482,6 +834,25 @@ def dashboard_filters_view(request):
                     }
                     for record in chart_records
                 ],
+                "stats_summary": {
+                    "total_calls": total_count,
+                    "avg_duration": float(duration_summary["avg_duration"] or 0),
+                    "total_duration": int(duration_summary["total_duration"] or 0),
+                    "status_counts": [
+                        {
+                            "status": row["status"] or "unknown",
+                            "count": row["count"],
+                            "percentage": (row["count"] / total_count * 100)
+                            if total_count
+                            else 0,
+                        }
+                        for row in status_summary_rows
+                    ],
+                },
+                "status_matrix": {
+                    "statuses": matrix_statuses,
+                    "rows": status_matrix,
+                },
                 "flow_breakdown": flow_breakdown,
             },
         }

@@ -44,6 +44,16 @@ class Dialer(models.Model):
 
     class Meta:
         ordering = ["dialer_name"]
+        indexes = [
+            models.Index(
+                fields=["client", "active", "dialer_name"],
+                name="dialer_client_active_name_idx",
+            ),
+            models.Index(
+                fields=["client", "active", "id"],
+                name="dialer_client_active_id_idx",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.dialer_name
@@ -52,6 +62,7 @@ class Dialer(models.Model):
 class CallLog(models.Model):
     call_uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     call_id = models.BigIntegerField(
+        db_index=True,
         validators=[
             MinValueValidator(1_000_000_000),
             MaxValueValidator(9_999_999_999),
@@ -63,13 +74,28 @@ class CallLog(models.Model):
         on_delete=models.CASCADE,
         related_name="call_logs",
     )
-    status = models.CharField(max_length=255)
+    status = models.CharField(max_length=255, db_index=True)
     state = models.CharField(max_length=255, null=True, blank=True)
     duration = models.IntegerField(default=0)
-    created_at = models.DateTimeField(auto_now_add=True)
+    call_recording_link = models.URLField(max_length=1000, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         ordering = ["-id"]
+        indexes = [
+            models.Index(
+                fields=["dialer", "-created_at", "-id"],
+                name="cl_dialer_created_id_idx",
+            ),
+            models.Index(
+                fields=["dialer", "status", "-created_at", "-id"],
+                name="cl_dialer_status_created_idx",
+            ),
+            models.Index(
+                fields=["-created_at", "-id"],
+                name="cl_created_id_idx",
+            ),
+        ]
 
     def __str__(self) -> str:
         return str(self.call_id)
@@ -112,5 +138,12 @@ class RESTAPITOKENS(models.Model):
         verbose_name = "REST API token"
         verbose_name_plural = "REST API tokens"
 
+    @property
+    def masked_token(self) -> str:
+        if len(self.token) <= 8:
+            return "*" * len(self.token)
+
+        return f"{self.token[:4]}...{self.token[-4:]}"
+
     def __str__(self) -> str:
-        return self.token
+        return self.masked_token
