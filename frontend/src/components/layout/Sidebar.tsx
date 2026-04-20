@@ -1,6 +1,6 @@
 import type { ElementType } from "react";
 import { useEffect, useState } from "react";
-import { LayoutDashboard, PanelLeftDashed, Settings } from "lucide-react";
+import { LayoutDashboard, PanelLeftDashed, Search, Settings } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 import UserDropdown from "./UserDropdown";
@@ -26,7 +26,10 @@ type MenuGroup = {
 const menuGroups: MenuGroup[] = [
   {
     title: "General",
-    items: [{ label: "Dashboard", icon: LayoutDashboard, href: "/dashboard" }],
+    items: [
+      { label: "Dashboard", icon: LayoutDashboard, href: "/dashboard" },
+      { label: "Call Lookup", icon: Search, href: "/call-lookup" },
+    ],
   },
   {
     title: "Settings",

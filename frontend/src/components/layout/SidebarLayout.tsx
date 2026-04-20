@@ -92,6 +92,9 @@ export default function SidebarLayout() {
     if (location.pathname.startsWith("/account")) {
       return "Account";
     }
+    if (location.pathname.startsWith("/call-lookup")) {
+      return "Call Lookup";
+    }
 
     return "Dashboard";
   }, [location.pathname]);

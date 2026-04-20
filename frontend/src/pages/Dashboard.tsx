@@ -433,17 +433,46 @@ const BASE_STATUS_COLORS = [
   "#4338ca",
 ];
 
-function getStatusColor(index: number) {
-  if (index < BASE_STATUS_COLORS.length) {
-    return BASE_STATUS_COLORS[index];
+const FIXED_STATUS_COLORS: Record<string, string> = {
+  dnc: "#dc2626",
+  live: "#16a34a",
+  raxfer: "#166534",
+};
+
+function getStatusColor(statusOrIndex: string | number, index?: number) {
+  if (typeof statusOrIndex === "string") {
+    const fixedColor = FIXED_STATUS_COLORS[statusOrIndex.trim().toLowerCase()];
+    if (fixedColor) {
+      return fixedColor;
+    }
   }
 
-  const generatedIndex = index - BASE_STATUS_COLORS.length;
+  const paletteIndex =
+    typeof statusOrIndex === "number" ? statusOrIndex : (index ?? 0);
+
+  if (paletteIndex < BASE_STATUS_COLORS.length) {
+    return BASE_STATUS_COLORS[paletteIndex];
+  }
+
+  const generatedIndex = paletteIndex - BASE_STATUS_COLORS.length;
   const hue = (generatedIndex * 47 + 23) % 360;
   const saturation = 62 + (generatedIndex % 3) * 6;
   const lightness = 44 + (generatedIndex % 4) * 5;
 
   return `hsl(${hue} ${saturation}% ${lightness}%)`;
+}
+
+function getStatusTextColor(status: string, index: number) {
+  const fixedColor = FIXED_STATUS_COLORS[status.trim().toLowerCase()];
+  if (fixedColor) {
+    return "#f8fafc";
+  }
+
+  if (index < BASE_STATUS_COLORS.length) {
+    const darkTextIndexes = new Set([1, 4, 7, 10]);
+    return darkTextIndexes.has(index % 12) ? "#1f2937" : "#f8fafc";
+  }
+  return "#f8fafc";
 }
 
 function prettifyStatusLabel(status: string) {
@@ -466,11 +495,6 @@ function formatDurationValue(seconds: number) {
   }
 
   return `${(seconds / 3600).toFixed(1)}h`;
-}
-
-function getStatsTileTextColor(index: number) {
-  const darkTextIndexes = new Set([1, 4, 7, 10]);
-  return darkTextIndexes.has(index % 12) ? "#1f2937" : "#f8fafc";
 }
 
 function getStatusCardStyle(color: string) {
@@ -676,7 +700,7 @@ export default function Dashboard() {
     return statusChart.statuses.reduce<ChartConfig>((config, status, index) => {
       config[status] = {
         label: prettifyStatusLabel(status),
-        color: getStatusColor(index),
+        color: getStatusColor(status, index),
       };
       return config;
     }, {});
@@ -967,40 +991,7 @@ export default function Dashboard() {
   return (
     <div className="min-h-full bg-[radial-gradient(circle_at_top_left,rgba(15,118,110,0.08),transparent_28%),radial-gradient(circle_at_top_right,rgba(37,99,235,0.08),transparent_26%)] px-4 py-6 text-foreground sm:px-6 sm:py-8">
       <div className="mx-auto max-w-7xl space-y-6">
-        <div className="flex flex-col gap-4 rounded-2xl border border-border/70 bg-card/80 px-5 py-5 shadow-sm backdrop-blur sm:flex-row sm:items-end sm:justify-between dark:border-white/10">
-          <div className="space-y-1">
-            <p className="text-xs uppercase tracking-[0.24em] text-muted-foreground">
-              Operations
-            </p>
-            <h1 className="text-3xl font-semibold tracking-tight">Dashboard</h1>
-            <p className="text-sm text-muted-foreground">
-              New York time • {dateLabel}
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {activeFilterChips.length > 0 ? (
-              activeFilterChips.map((chip) => (
-                <span
-                  key={chip}
-                  className="inline-flex items-center rounded-full border border-border/70 bg-background/80 px-3 py-1 text-xs font-medium text-muted-foreground dark:border-white/10"
-                >
-                  {chip}
-                </span>
-              ))
-            ) : (
-              <span className="inline-flex items-center rounded-full border border-border/70 bg-background/80 px-3 py-1 text-xs font-medium text-muted-foreground dark:border-white/10">
-                All active dialers
-              </span>
-            )}
-            {isRefreshing && !isLoading && (
-              <span className="inline-flex items-center rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
-                Refreshing
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="sticky top-0 z-20 -mt-6 pt-6" ref={stickyControlsRef}>
+        <div className="sticky top-0 z-20" ref={stickyControlsRef}>
           <div
             className={cn(
               "pointer-events-none absolute inset-x-0 top-0 h-6 rounded-t-[1.4rem] bg-background/85 backdrop-blur-3xl transition-opacity duration-300 supports-[backdrop-filter]:bg-background/70",
@@ -1009,9 +1000,9 @@ export default function Dashboard() {
           />
           <div
             className={cn(
-              "border border-border/70 bg-background/90 p-3 shadow-sm backdrop-blur-3xl transition-all duration-300 ease-out supports-[backdrop-filter]:bg-background/80 dark:border-white/10",
+              "border border-border/70 bg-background/75 p-3 shadow-sm backdrop-blur-3xl backdrop-saturate-150 transition-all duration-300 ease-out supports-[backdrop-filter]:bg-background/60 dark:border-white/10",
               controlsJoined
-                ? "rounded-t-none border-t-transparent bg-background/95 shadow-md supports-[backdrop-filter]:bg-background/88"
+                ? "rounded-t-none border-t-transparent bg-background/80 shadow-md supports-[backdrop-filter]:bg-background/65"
                 : "rounded-2xl"
             )}
           >
@@ -1022,7 +1013,7 @@ export default function Dashboard() {
                   setDraftDateRange(appliedDateRange);
                   setIsDateDialogOpen(true);
                 }}
-                className="group flex min-h-14 items-center justify-between rounded-xl border border-border/70 bg-background px-4 py-3 text-left transition-colors duration-200 hover:border-primary/50 hover:bg-accent/30 dark:border-white/10"
+                className="group flex min-h-14 items-center justify-between rounded-xl border border-border/70 bg-background/75 px-4 py-3 text-left backdrop-blur-xl transition-colors duration-200 hover:border-primary/50 hover:bg-accent/40 dark:border-white/10"
               >
                 <div className="space-y-1">
                   <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
@@ -1042,7 +1033,7 @@ export default function Dashboard() {
                 <Select value={selectedDialer} onValueChange={setSelectedDialer}>
                   <SelectTrigger
                     id="sticky-dialer-select"
-                    className="h-14 rounded-xl border-border/70 bg-background px-4 text-left dark:border-white/10"
+                    className="h-14 rounded-xl border-border/70 bg-background/75 px-4 text-left backdrop-blur-xl dark:border-white/10"
                   >
                     <SelectValue placeholder="All" />
                   </SelectTrigger>
@@ -1058,7 +1049,7 @@ export default function Dashboard() {
               </div>
 
               <div className="flex items-end">
-                <div className="flex h-14 min-w-[170px] items-center gap-3 rounded-xl border border-border/70 bg-background px-4 dark:border-white/10">
+                <div className="flex h-14 min-w-[170px] items-center gap-3 rounded-xl border border-border/70 bg-background/75 px-4 backdrop-blur-xl dark:border-white/10">
                   <div className="space-y-0.5">
                     <p className="text-sm font-medium">Auto refresh</p>
                     <p className="text-xs text-muted-foreground">5 seconds</p>
@@ -1289,8 +1280,8 @@ export default function Dashboard() {
                       </p>
                     </div>
                     {statsSummary.status_counts.map((statusItem, index) => {
-                      const statusColor = getStatusColor(index);
-                      const tileTextColor = getStatsTileTextColor(index);
+                      const statusColor = getStatusColor(statusItem.status, index);
+                      const tileTextColor = getStatusTextColor(statusItem.status, index);
 
                       return (
                         <div
@@ -1522,8 +1513,8 @@ export default function Dashboard() {
                             <TableHead className="min-w-[240px]">Client Dialer Name</TableHead>
                             <TableHead className="min-w-[120px]">Total Calls</TableHead>
                             {statusMatrix.statuses.map((status, index) => (
-                              <TableHead key={status} className="min-w-[110px] text-center">
-                                <span style={{ color: getStatusColor(index) }}>
+                            <TableHead key={status} className="min-w-[110px] text-center">
+                                <span style={{ color: getStatusColor(status, index) }}>
                                   {prettifyStatusLabel(status)}
                                 </span>
                               </TableHead>
@@ -1548,7 +1539,7 @@ export default function Dashboard() {
                                     <div className="space-y-1">
                                       <p
                                         className="font-mono tabular-nums text-sm font-semibold"
-                                        style={{ color: getStatusColor(index) }}
+                                        style={{ color: getStatusColor(status, index) }}
                                       >
                                         {statusValue.percentage.toFixed(1)}%
                                       </p>
@@ -1684,6 +1675,7 @@ export default function Dashboard() {
                       <TableBody>
                         {records.map((record, index) => {
                           const statusColor = getStatusColor(
+                            record.status,
                             availableStatuses.indexOf(record.status)
                           );
 

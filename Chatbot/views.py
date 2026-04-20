@@ -857,3 +857,42 @@ def dashboard_filters_view(request):
             },
         }
     )
+
+
+@require_GET
+def call_log_search_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    raw_call_id = (request.GET.get("call_id") or "").strip()
+    if not raw_call_id:
+        return _json_error("call_id is required.", status=400)
+
+    try:
+        normalized_call_id = _normalize_int(
+            raw_call_id,
+            "call_id",
+            minimum=1_000_000_000,
+            maximum=9_999_999_999,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    matched_logs = list(
+        CallLog.objects.select_related("dialer")
+        .filter(
+            call_id=normalized_call_id,
+            dialer__client=client,
+        )
+        .order_by("-created_at", "-id")
+    )
+
+    return _json_response(
+        {
+            "call_id": normalized_call_id,
+            "exists": bool(matched_logs),
+            "count": len(matched_logs),
+            "records": [_serialize_call_log(call_log) for call_log in matched_logs],
+        }
+    )

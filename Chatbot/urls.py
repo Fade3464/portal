@@ -4,6 +4,7 @@ from .views import (
     account_password_view,
     account_password_verify_view,
     account_profile_view,
+    call_log_search_view,
     check_auth_view,
     check_blacklisted_number_view,
     create_call_log_view,
@@ -25,6 +26,7 @@ urlpatterns = [
         name="account_password_verify",
     ),
     path("api/account/password/", account_password_view, name="account_password"),
+    path("api/call-logs/search/", call_log_search_view, name="call_log_search"),
     path(
         "api/dashboard/filters/",
         dashboard_filters_view,
