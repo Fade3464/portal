@@ -16,6 +16,9 @@ db.sqlite3
 media/
 staticfiles/
 
+# Frontend build output
+frontend/dist/
+
 # IDE
 .vscode/
 .idea/

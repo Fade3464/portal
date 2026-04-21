@@ -1,23 +1,42 @@
 import csv
+import base64
+from datetime import timedelta
+import hashlib
+import hmac
 import json
+import os
+import random
+import struct
+import time
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
+from django.views.decorators.csrf import csrf_exempt
 
+from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.core.exceptions import ValidationError
+from django.core import signing
 from django.core.validators import URLValidator, validate_email
+from django.db import transaction
 from django.db.models import Avg, Count, Sum
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
-from .models import BlacklistedNumbers, CallLog, Dialer, RESTAPITOKENS
+from .models import BlacklistedNumbers, CallLog, Dialer, LoginRateLimit, RESTAPITOKENS
+from .api_token_cache import get_active_api_tokens, preload_active_api_tokens
+from .route_cache import get_dialer_route_map, preload_dialer_route_map
 
 AREA_CODES_CSV_PATH = Path("/home/kali/new1.2/assets/us_area_codes.csv")
 url_validator = URLValidator()
+PASSWORD_RESET_SALT = "chatbot-forgot-password-v1"
+TOTP_ISSUER = "Portal"
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_LOCKOUT_SECONDS = 3600
 
 
 def _get_user_display_name(user):
@@ -33,11 +52,134 @@ def _json_response(payload, status=200):
     return JsonResponse({"status_code": status, **payload}, status=status)
 
 
+def _generate_totp_secret():
+    return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
+
+
+def _pad_base32_secret(secret):
+    normalized_secret = (secret or "").strip().replace(" ", "").upper()
+    padding_length = (-len(normalized_secret)) % 8
+    return normalized_secret + ("=" * padding_length)
+
+
+def _build_totp_uri(secret, account_name):
+    label = quote(f"{TOTP_ISSUER}:{account_name}")
+    issuer = quote(TOTP_ISSUER)
+    return f"otpauth://totp/{label}?secret={secret}&issuer={issuer}&digits=6&period=30"
+
+
+def _generate_totp_code(secret, counter):
+    key = base64.b32decode(_pad_base32_secret(secret), casefold=True)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % 1_000_000).zfill(6)
+
+
+def _verify_totp_code(secret, otp, *, window=1, at_time=None):
+    normalized_otp = (otp or "").strip()
+    if not normalized_otp.isdigit() or len(normalized_otp) != 6 or not secret:
+        return False
+
+    current_time = int(at_time or time.time())
+    current_counter = current_time // 30
+
+    for delta in range(-window, window + 1):
+        if _generate_totp_code(secret, current_counter + delta) == normalized_otp:
+            return True
+
+    return False
+
+
+def _create_password_reset_token(user_id, email):
+    payload = {"user_id": user_id, "email": email}
+    return signing.dumps(payload, salt=PASSWORD_RESET_SALT)
+
+
+def _read_password_reset_token(token, *, max_age=600):
+    return signing.loads(token, salt=PASSWORD_RESET_SALT, max_age=max_age)
+
+
 def _load_json_body(request):
     try:
         return json.loads(request.body or "{}")
     except json.JSONDecodeError:
         raise ValueError("Invalid JSON payload.")
+
+
+def _get_client_ip(request):
+    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    return (
+        request.META.get("HTTP_X_REAL_IP")
+        or request.META.get("REMOTE_ADDR")
+        or ""
+    ).strip()
+
+
+def _get_login_rate_limit(ip_address):
+    if not ip_address:
+        return None
+
+    return LoginRateLimit.objects.filter(ip_address=ip_address).first()
+
+
+def _get_lockout_error(rate_limit):
+    if not rate_limit or not rate_limit.locked_until:
+        return None
+
+    now = timezone.now()
+    if rate_limit.locked_until <= now:
+        if rate_limit.failed_attempts or rate_limit.last_failed_at or rate_limit.locked_until:
+            rate_limit.failed_attempts = 0
+            rate_limit.last_failed_at = None
+            rate_limit.locked_until = None
+            rate_limit.save(update_fields=["failed_attempts", "last_failed_at", "locked_until"])
+        return None
+
+    remaining_minutes = max(
+        1,
+        int((rate_limit.locked_until - now).total_seconds() // 60),
+    )
+    return _json_error(
+        f"Too many failed login attempts. Try again in about {remaining_minutes} minutes.",
+        status=429,
+    )
+
+
+def _record_failed_login_attempt(ip_address):
+    if not ip_address:
+        return None
+
+    now = timezone.now()
+    rate_limit, _ = LoginRateLimit.objects.get_or_create(ip_address=ip_address)
+
+    if rate_limit.locked_until and rate_limit.locked_until <= now:
+        rate_limit.failed_attempts = 0
+        rate_limit.locked_until = None
+
+    rate_limit.failed_attempts += 1
+    rate_limit.last_failed_at = now
+
+    if rate_limit.failed_attempts >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS:
+        rate_limit.locked_until = now + timedelta(seconds=LOGIN_RATE_LIMIT_LOCKOUT_SECONDS)
+
+    rate_limit.save(update_fields=["failed_attempts", "last_failed_at", "locked_until"])
+    return rate_limit
+
+
+def _clear_failed_login_attempts(ip_address):
+    if not ip_address:
+        return
+
+    LoginRateLimit.objects.filter(ip_address=ip_address).update(
+        failed_attempts=0,
+        last_failed_at=None,
+        locked_until=None,
+    )
 
 
 def _extract_api_token(request):
@@ -56,15 +198,22 @@ def _require_call_log_api_token(request):
     if not provided_token:
         return _json_error("Invalid API token.", status=401)
 
-    token_exists = RESTAPITOKENS.objects.filter(
-        token=provided_token,
-        is_active=True,
-    ).exists()
+    active_tokens = get_active_api_tokens()
+    token_exists = provided_token in active_tokens
+
+    if not token_exists:
+        preload_active_api_tokens()
+        token_exists = provided_token in get_active_api_tokens()
 
     if not token_exists:
         return _json_error("Invalid API token.", status=401)
 
     return None
+
+
+def _refresh_dialer_route_map():
+    preload_dialer_route_map()
+    return get_dialer_route_map()
 
 
 def _resolve_dialer(payload):
@@ -114,6 +263,24 @@ def _normalize_optional_string(value, field_name, max_length):
     return normalized_value
 
 
+def _parse_dialer_batch_values(raw_batch):
+    if raw_batch in (None, ""):
+        return []
+
+    values = []
+    for item in str(raw_batch).split(","):
+        normalized = item.strip()
+        if not normalized:
+            continue
+
+        try:
+            values.append(int(normalized))
+        except ValueError as exc:
+            raise ValueError("Dialer batch must contain comma-separated integers.") from exc
+
+    return values
+
+
 def _normalize_required_string(value, field_name, max_length):
     normalized_value = _normalize_optional_string(value, field_name, max_length)
     if not normalized_value:
@@ -135,6 +302,18 @@ def _normalize_recording_link(value):
         raise ValueError("call_recording_link must be a valid URL.") from exc
 
     return normalized_value
+
+
+def _build_call_recording_link(call_uuid):
+    base_url = getattr(settings, "CALL_RECORDINGS_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        return None
+
+    file_extension = (
+        getattr(settings, "CALL_RECORDINGS_FILE_EXTENSION", "wav").strip().lstrip(".")
+        or "wav"
+    )
+    return f"{base_url}/{call_uuid}.{file_extension}"
 
 
 def _validate_call_log_payload(payload, *, require_status=False):
@@ -159,12 +338,41 @@ def _validate_call_log_payload(payload, *, require_status=False):
     if "state" in payload:
         normalized["state"] = _normalize_optional_string(payload.get("state"), "state", 255)
 
+    if not require_status and "flow" in payload:
+        normalized["flow"] = _normalize_optional_string(payload.get("flow"), "flow", 255)
+
+    if not require_status and "batch" in payload:
+        normalized["batch"] = _normalize_int(payload.get("batch"), "batch")
+
     if "call_recording_link" in payload or require_status:
         normalized["call_recording_link"] = _normalize_recording_link(
             payload.get("call_recording_link")
         )
 
     return normalized
+
+
+def _get_call_log_flow_and_batch(dialer_id):
+    with transaction.atomic():
+        dialer = (
+            Dialer.objects.select_for_update()
+            .only("id", "flow", "batch", "batch_cursor")
+            .get(id=dialer_id)
+        )
+
+        batch_values = _parse_dialer_batch_values(dialer.batch)
+        selected_batch = batch_values[0] if batch_values else 0
+
+        if batch_values:
+            selected_index = dialer.batch_cursor % len(batch_values)
+            selected_batch = batch_values[selected_index]
+            dialer.batch_cursor = (dialer.batch_cursor + 1) % len(batch_values)
+            dialer.save(update_fields=["batch_cursor"])
+
+        return {
+            "flow": dialer.flow or "",
+            "batch": selected_batch,
+        }
 
 
 @lru_cache(maxsize=1)
@@ -261,9 +469,13 @@ def _serialize_account_profile(client):
         "display_name": _get_user_display_name(user),
         "username": user.get_username(),
         "email": user.email,
-        "backup_email": client.backup_email,
         "client_name": client.client_name,
+        "recovery_authenticator_enabled": client.recovery_totp_enabled,
     }
+
+
+def _is_recovery_authenticator_enabled(client):
+    return bool(client and client.recovery_totp_enabled and client.recovery_totp_secret)
 
 
 def _normalize_email(value, field_name, *, required=False):
@@ -283,6 +495,57 @@ def _normalize_email(value, field_name, *, required=False):
 
     return normalized_value
 
+
+def _get_client_by_email(email):
+    if not email:
+        return None
+
+    User = get_user_model()
+    user = User.objects.filter(email__iexact=email).select_related("client_profile").first()
+    if user is None:
+        return None
+
+    return getattr(user, "client_profile", None)
+
+
+def _get_user_by_email(email):
+    if not email:
+        return None
+
+    User = get_user_model()
+    return User.objects.filter(email__iexact=email).select_related("client_profile").order_by("id").first()
+
+
+@require_POST
+def login_options_view(request):
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    try:
+        email = _normalize_email(payload.get("email"), "email", required=True)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    user = _get_user_by_email(email)
+    if user is None:
+        return _json_error("No account was found for this email.", status=404)
+
+    if not user.is_active:
+        return _json_error("This account is inactive.", status=403)
+
+    client = getattr(user, "client_profile", None)
+    authenticator_enabled = _is_recovery_authenticator_enabled(client)
+
+    return _json_response(
+        {
+            "email": email,
+            "authenticator_enabled": authenticator_enabled,
+            "password_fallback_enabled": True,
+        }
+    )
+
 @require_POST
 def login_view(request):
     try:
@@ -290,33 +553,80 @@ def login_view(request):
     except ValueError as exc:
         return _json_error(str(exc))
 
+    client_ip = _get_client_ip(request)
+    rate_limit = _get_login_rate_limit(client_ip)
+    lockout_error = _get_lockout_error(rate_limit)
+    if lockout_error:
+        return lockout_error
+
     email = (payload.get("email") or "").strip().lower()
     password = payload.get("password") or ""
+    otp = (payload.get("otp") or "").strip()
 
-    if not email or not password:
-        return _json_error("Email and password are required.")
+    if not email:
+        return _json_error("Email is required.")
 
-    User = get_user_model()
-    user_record = User.objects.filter(email__iexact=email).order_by("id").first()
+    user_record = _get_user_by_email(email)
     username = user_record.get_username() if user_record else email
+
+    if otp:
+        if user_record is None:
+            _record_failed_login_attempt(client_ip)
+            return _json_error("Invalid email or authenticator code.", status=401)
+
+        if not user_record.is_active:
+            return _json_error("This account is inactive.", status=403)
+
+        client = getattr(user_record, "client_profile", None)
+        if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+            return _json_error("Authenticator login is not enabled for this account.", status=400)
+
+        if not _verify_totp_code(client.recovery_totp_secret, otp):
+            _record_failed_login_attempt(client_ip)
+            return _json_error("Invalid email or authenticator code.", status=401)
+
+        login(request, user_record)
+        _clear_failed_login_attempts(client_ip)
+
+        return _json_response(
+            {
+                "message": "Login successful.",
+                "login_method": "otp",
+                "user": {
+                    "id": user_record.id,
+                    "username": user_record.get_username(),
+                    "display_name": _get_user_display_name(user_record),
+                    "email": user_record.email,
+                    "recovery_authenticator_enabled": True,
+                },
+            }
+        )
+
+    if not password:
+        return _json_error("Password is required.")
 
     user = authenticate(request, username=username, password=password)
     if user is None:
+        _record_failed_login_attempt(client_ip)
         return _json_error("Invalid email or password.", status=401)
 
     if not user.is_active:
         return _json_error("This account is inactive.", status=403)
 
     login(request, user)
+    _clear_failed_login_attempts(client_ip)
+    client = getattr(user, "client_profile", None)
 
     return _json_response(
         {
             "message": "Login successful.",
+            "login_method": "password",
             "user": {
                 "id": user.id,
                 "username": user.get_username(),
                 "display_name": _get_user_display_name(user),
                 "email": user.email,
+                "recovery_authenticator_enabled": _is_recovery_authenticator_enabled(client),
             },
         }
     )
@@ -353,6 +663,13 @@ def check_auth_view(request):
     return response
 
 
+@ensure_csrf_cookie
+@require_GET
+def csrf_token_view(request):
+    get_token(request)
+    return _json_response({"message": "CSRF cookie set."})
+
+
 @require_http_methods(["GET", "PATCH"])
 def account_profile_view(request):
     client, error_response = _get_authenticated_client(request)
@@ -375,7 +692,6 @@ def account_profile_view(request):
         first_name = _normalize_optional_string(payload.get("first_name"), "first_name", 150)
         last_name = _normalize_optional_string(payload.get("last_name"), "last_name", 150)
         email = _normalize_email(payload.get("email"), "email", required=True)
-        backup_email = _normalize_email(payload.get("backup_email"), "backup_email")
     except ValueError as exc:
         return _json_error(str(exc), status=400)
 
@@ -397,9 +713,6 @@ def account_profile_view(request):
     user.last_name = last_name or ""
     user.email = email
     user.save(update_fields=["first_name", "last_name", "email"])
-
-    client.backup_email = backup_email
-    client.save(update_fields=["backup_email"])
 
     return _json_response(
         {
@@ -428,6 +741,54 @@ def account_password_verify_view(request):
         return _json_error("Current password is incorrect.", status=400)
 
     return _json_response({"message": "Current password verified."})
+
+
+@require_POST
+def account_authenticator_setup_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    if client.recovery_totp_enabled and client.recovery_totp_secret:
+        return _json_error("Recovery authenticator is already enabled for this account.", status=400)
+
+    secret = _generate_totp_secret()
+    client.recovery_totp_secret = secret
+    client.recovery_totp_enabled = False
+    client.save(update_fields=["recovery_totp_secret", "recovery_totp_enabled"])
+
+    account_name = client.user.email or client.user.get_username()
+    return _json_response(
+        {
+            "message": "Recovery authenticator setup started.",
+            "setup_key": secret,
+            "otpauth_url": _build_totp_uri(secret, account_name),
+        }
+    )
+
+
+@require_POST
+def account_authenticator_verify_view(request):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    otp = payload.get("otp") or ""
+    if not client.recovery_totp_secret:
+        return _json_error("Authenticator setup has not been started.", status=400)
+
+    if not _verify_totp_code(client.recovery_totp_secret, otp):
+        return _json_error("Invalid authenticator code.", status=400)
+
+    client.recovery_totp_enabled = True
+    client.save(update_fields=["recovery_totp_enabled"])
+
+    return _json_response({"message": "Recovery authenticator enabled successfully."})
 
 
 @require_POST
@@ -467,6 +828,219 @@ def account_password_view(request):
     return _json_response({"message": "Password updated successfully."})
 
 
+@require_POST
+def forgot_password_start_view(request):
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    try:
+        email = _normalize_email(payload.get("email"), "email", required=True)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    client = _get_client_by_email(email)
+    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+        return _json_error(
+            "Recovery authenticator is not configured for this account.",
+            status=400,
+        )
+
+    return _json_response(
+        {
+            "message": "Enter the 6-digit code from your Google Authenticator app.",
+            "email": email,
+        }
+    )
+
+
+@require_POST
+def forgot_password_verify_view(request):
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    try:
+        email = _normalize_email(payload.get("email"), "email", required=True)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    otp = payload.get("otp") or ""
+    client = _get_client_by_email(email)
+    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+        return _json_error(
+            "Recovery authenticator is not configured for this account.",
+            status=400,
+        )
+
+    if not _verify_totp_code(client.recovery_totp_secret, otp):
+        return _json_error("Invalid authenticator code.", status=400)
+
+    reset_token = _create_password_reset_token(client.user_id, client.user.email)
+    return _json_response(
+        {
+            "message": "Authenticator code verified successfully.",
+            "reset_token": reset_token,
+        }
+    )
+
+
+@require_POST
+def forgot_password_reset_view(request):
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    reset_token = payload.get("reset_token") or ""
+    new_password = payload.get("new_password") or ""
+    confirm_password = payload.get("confirm_password") or ""
+
+    if not reset_token:
+        return _json_error("reset_token is required.", status=400)
+
+    if not new_password or not confirm_password:
+        return _json_error("Both password fields are required.", status=400)
+
+    if new_password != confirm_password:
+        return _json_error("New password and confirmation do not match.", status=400)
+
+    if len(new_password) < 8:
+        return _json_error("New password must be at least 8 characters long.", status=400)
+
+    try:
+        token_data = _read_password_reset_token(reset_token)
+    except signing.SignatureExpired:
+        return _json_error("Invalid or expired reset token.", status=400)
+    except signing.BadSignature:
+        return _json_error("Invalid or expired reset token.", status=400)
+
+    User = get_user_model()
+    user = User.objects.filter(id=token_data.get("user_id"), email__iexact=token_data.get("email", "")).first()
+    if user is None:
+        return _json_error("Invalid or expired reset token.", status=400)
+
+    client = getattr(user, "client_profile", None)
+    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+        return _json_error("Recovery authenticator is not configured for this account.", status=400)
+
+    user.set_password(new_password)
+    user.save(update_fields=["password"])
+
+    return _json_response({"message": "Password reset successful. You can now sign in."})
+
+
+@require_GET
+def preload_dialer_routes_view(request):
+    token_error = _require_call_log_api_token(request)
+    if token_error:
+        return token_error
+
+    route_map = _refresh_dialer_route_map()
+    dialers = [
+        {
+            "dialer_name": details["dialer_name"],
+            "route_ips": details["route_ips"],
+        }
+        for details in sorted(route_map.values(), key=lambda item: item["dialer_name"].lower())
+    ]
+
+    return _json_response(
+        {
+            "message": "Dialer routes preloaded successfully.",
+            "dialers": dialers,
+            "dialer_count": len(dialers),
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def request_route_view(request):
+    token_error = _require_call_log_api_token(request)
+    if token_error:
+        return token_error
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    dialer_name = (payload.get("dialer_name") or "").strip()
+    if not dialer_name:
+        return _json_error("dialer_name is required.", status=400)
+
+    normalized_name = dialer_name.lower()
+    route_map = get_dialer_route_map()
+    dialer_details = route_map.get(normalized_name)
+
+    if dialer_details is None:
+        route_map = _refresh_dialer_route_map()
+        dialer_details = route_map.get(normalized_name)
+
+    if dialer_details is None:
+        return _json_error("No dialer found for the provided dialer_name.", status=404)
+
+    route_ips = dialer_details["route_ips"]
+    if not route_ips:
+        return _json_error("No route IPs are configured for the provided dialer_name.", status=404)
+
+    selected_route_ip = random.choice(route_ips)
+
+    return _json_response(
+        {
+            "message": "Route IP fetched successfully.",
+            "dialer_name": dialer_details["dialer_name"],
+            "project": dialer_details["project"],
+            "xferexten": dialer_details["xferexten"],
+            "agent_api_url": dialer_details["agent_api_url"],
+            "non_agent_api_url": dialer_details["non_agent_api_url"],
+            "api_user": dialer_details["api_user"],
+            "api_password": dialer_details["api_password"],
+            "route_ip": selected_route_ip,
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def check_batchnflow_view(request):
+    token_error = _require_call_log_api_token(request)
+    if token_error:
+        return token_error
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    dialer_name = (payload.get("dialer_name") or "").strip()
+    if not dialer_name:
+        return _json_error("dialer_name is required.", status=400)
+
+    normalized_name = dialer_name.lower()
+    route_map = get_dialer_route_map()
+    dialer_details = route_map.get(normalized_name)
+
+    if dialer_details is None:
+        route_map = _refresh_dialer_route_map()
+        dialer_details = route_map.get(normalized_name)
+
+    if dialer_details is None:
+        return _json_error("No dialer found for the provided dialer_name.", status=404)
+
+    return _json_response(
+        {
+            "message": "Batch and flow fetched successfully.",
+            "dialer_name": dialer_details["dialer_name"],
+            "batch": dialer_details["batch"],
+            "flow": dialer_details["flow"],
+        }
+    )
+
+
 @csrf_exempt
 @require_POST
 def create_call_log_view(request):
@@ -489,15 +1063,24 @@ def create_call_log_view(request):
         resolved_state = normalized_fields.get("state")
         if resolved_state is None:
             resolved_state = _derive_state_from_call_id(resolved_call_id)
+        call_log_assignment = _get_call_log_flow_and_batch(dialer.id)
 
         call_log = CallLog.objects.create(
             call_id=resolved_call_id,
             dialer=dialer,
             status=normalized_fields["status"],
             state=resolved_state,
+            flow=call_log_assignment["flow"],
+            batch=call_log_assignment["batch"],
             duration=normalized_fields["duration"],
             call_recording_link=normalized_fields.get("call_recording_link"),
         )
+
+        if not call_log.call_recording_link:
+            generated_recording_link = _build_call_recording_link(call_log.call_uuid)
+            if generated_recording_link:
+                call_log.call_recording_link = generated_recording_link
+                call_log.save(update_fields=["call_recording_link"])
     except ValueError as exc:
         return _json_error(str(exc), status=400)
 
@@ -556,9 +1139,22 @@ def update_call_log_view(request, call_uuid):
         call_log.duration = normalized_fields["duration"]
         update_fields.append("duration")
 
+    if "flow" in normalized_fields:
+        call_log.flow = normalized_fields["flow"] or ""
+        update_fields.append("flow")
+
+    if "batch" in normalized_fields:
+        call_log.batch = normalized_fields["batch"] or 0
+        update_fields.append("batch")
+
     if "call_recording_link" in normalized_fields:
         call_log.call_recording_link = normalized_fields["call_recording_link"]
         update_fields.append("call_recording_link")
+    elif not call_log.call_recording_link:
+        generated_recording_link = _build_call_recording_link(call_log.call_uuid)
+        if generated_recording_link:
+            call_log.call_recording_link = generated_recording_link
+            update_fields.append("call_recording_link")
 
     if "state" in normalized_fields:
         call_log.state = normalized_fields["state"]
@@ -705,19 +1301,19 @@ def dashboard_filters_view(request):
         filtered_logs.values(
             "dialer__id",
             "dialer__dialer_name",
-            "dialer__flow",
-            "dialer__batch",
+            "flow",
+            "batch",
         )
         .annotate(count=Count("id"))
-        .order_by("dialer__dialer_name", "dialer__flow", "dialer__batch")
+        .order_by("dialer__dialer_name", "flow", "batch")
     )
 
     dialer_lookup = {}
     for row in breakdown_rows:
         dialer_id = row["dialer__id"]
         dialer_name = row["dialer__dialer_name"]
-        flow_name = row["dialer__flow"] or "unknown"
-        batch_value = row["dialer__batch"]
+        flow_name = row["flow"] or "unknown"
+        batch_value = row["batch"]
         count = row["count"]
 
         if dialer_id not in dialer_lookup:

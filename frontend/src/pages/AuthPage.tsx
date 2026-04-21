@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { Moon, Sun } from "lucide-react";
+import { Moon, ShieldCheck, Sun } from "lucide-react";
 
 import { UserAuthForm } from "@/components/UserAuthForm";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -89,7 +89,8 @@ export default function AuthPage() {
   }
 
   return (
-    <div className="relative flex h-screen w-screen items-center justify-center bg-background text-foreground transition-colors duration-500">
+    <div className="relative flex h-screen w-screen items-center justify-center overflow-hidden bg-background text-foreground transition-colors duration-500">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(15,118,110,0.12),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(37,99,235,0.12),transparent_32%)]" />
       <div className="absolute top-6 right-6">
         <Button
           variant="outline"
@@ -105,9 +106,9 @@ export default function AuthPage() {
         </Button>
       </div>
 
-      <div className="flex w-[90%] flex-col items-center justify-center rounded-2xl border bg-card p-8 text-card-foreground shadow-2xl backdrop-blur-md transition-all sm:w-[400px]">
+      <div className="relative w-[92%] max-w-[440px] overflow-hidden rounded-3xl border border-border/40 bg-card/95 text-card-foreground shadow-2xl backdrop-blur-md transition-all motion-safe:animate-in motion-safe:fade-in-0 motion-safe:zoom-in-95 motion-safe:duration-500 dark:border-white/10">
         {authError && (
-          <Alert variant="destructive" className="relative mb-4 w-full pr-10">
+          <Alert variant="destructive" className="absolute top-6 left-6 right-6 z-10 pr-10 md:right-auto md:w-[360px]">
             <AlertTitle>Unauthorized</AlertTitle>
             <AlertDescription>{authError}</AlertDescription>
 
@@ -121,14 +122,21 @@ export default function AuthPage() {
           </Alert>
         )}
 
-        <div className="mb-6 text-center">
-          <h1 className="text-3xl font-semibold tracking-tight">Welcome Back</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Sign in to access your dashboard
-          </p>
-        </div>
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-32 bg-[radial-gradient(circle_at_top,rgba(15,118,110,0.14),transparent_68%)] dark:bg-[radial-gradient(circle_at_top,rgba(45,212,191,0.12),transparent_68%)]" />
 
-        <UserAuthForm />
+        <div className="flex min-h-[460px] w-full flex-col justify-center p-8 sm:p-9">
+          <div className="mb-8 flex flex-col items-center text-center">
+            <div className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-2xl border border-border/60 bg-background/80 shadow-sm dark:border-white/10 dark:bg-white/5">
+              <ShieldCheck className="h-6 w-6 text-teal-600 dark:text-teal-400" />
+            </div>
+            <h2 className="text-3xl font-semibold tracking-tight">Sign in</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Welcome Back!
+            </p>
+          </div>
+
+          <UserAuthForm />
+        </div>
       </div>
     </div>
   );

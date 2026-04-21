@@ -27,7 +27,7 @@ const menuGroups: MenuGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Dashboard", icon: LayoutDashboard, href: "/dashboard" },
+      { label: "Insights", icon: LayoutDashboard, href: "/dashboard" },
       { label: "Call Lookup", icon: Search, href: "/call-lookup" },
     ],
   },

@@ -12,7 +12,8 @@ class Client(models.Model):
         related_name="client_profile",
     )
     client_name = models.CharField(max_length=255)
-    backup_email = models.EmailField(blank=True)
+    recovery_totp_secret = models.CharField(max_length=64, blank=True)
+    recovery_totp_enabled = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["client_name"]
@@ -26,16 +27,21 @@ class Client(models.Model):
 
 
 class Dialer(models.Model):
-    dialer_name = models.CharField(max_length=255)
+    dialer_name = models.CharField(max_length=255, db_index=True)
     client = models.ForeignKey(
         Client,
         on_delete=models.CASCADE,
         related_name="dialers",
     )
     project = models.CharField(max_length=255)
-    xferexten = models.IntegerField()
+    xferexten = models.CharField(max_length=64)
+    agent_api_url = models.URLField(max_length=1000, null=True, blank=True)
+    non_agent_api_url = models.URLField(max_length=1000, null=True, blank=True)
+    api_user = models.CharField(max_length=255, null=True, blank=True)
+    api_password = models.CharField(max_length=255, null=True, blank=True)
     agent_count = models.IntegerField()
-    batch = models.IntegerField()
+    batch = models.CharField(max_length=255)
+    batch_cursor = models.PositiveIntegerField(default=0)
     route_ip = models.TextField(
         help_text="Store one or more IPs. Separate multiple IPs with commas or new lines."
     )
@@ -76,6 +82,8 @@ class CallLog(models.Model):
     )
     status = models.CharField(max_length=255, db_index=True)
     state = models.CharField(max_length=255, null=True, blank=True)
+    flow = models.CharField(max_length=255, blank=True, default="")
+    batch = models.IntegerField(default=0)
     duration = models.IntegerField(default=0)
     call_recording_link = models.URLField(max_length=1000, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -99,14 +107,6 @@ class CallLog(models.Model):
 
     def __str__(self) -> str:
         return str(self.call_id)
-
-    @property
-    def flow(self) -> str:
-        return self.dialer.flow
-
-    @property
-    def batch(self) -> int:
-        return self.dialer.batch
 
 
 class BlacklistedNumbers(models.Model):
@@ -147,3 +147,18 @@ class RESTAPITOKENS(models.Model):
 
     def __str__(self) -> str:
         return self.masked_token
+
+
+class LoginRateLimit(models.Model):
+    ip_address = models.GenericIPAddressField(unique=True)
+    failed_attempts = models.PositiveSmallIntegerField(default=0)
+    last_failed_at = models.DateTimeField(null=True, blank=True)
+    locked_until = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["ip_address"]
+        verbose_name = "Login rate limit"
+        verbose_name_plural = "Login rate limits"
+
+    def __str__(self) -> str:
+        return self.ip_address

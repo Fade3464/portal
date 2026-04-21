@@ -505,6 +505,20 @@ function getStatusCardStyle(color: string) {
   };
 }
 
+function getLiveStatusCardStyle(color: string) {
+  return {
+    ...getStatusCardStyle(color),
+    boxShadow: `inset 0 1px 0 color-mix(in srgb, ${color} 44%, white 56%), 0 14px 30px -18px ${color}, 0 0 0 1px color-mix(in srgb, ${color} 30%, transparent)`,
+  };
+}
+
+function getAnimatedLiveStatusCardStyle(color: string) {
+  return {
+    ...getLiveStatusCardStyle(color),
+    animation: "liveTileGlow 4.2s ease-in-out infinite",
+  } as const;
+}
+
 function getStatusPillStyle(color: string) {
   return {
     backgroundColor: `color-mix(in srgb, ${color} 10%, var(--background))`,
@@ -693,7 +707,15 @@ export default function Dashboard() {
       ? "All"
       : dialers.find((dialer) => String(dialer.id) === selectedDialer)?.dialer_name ??
         "Selected dialer";
+  const recordsRangeStart =
+  pagination.total_records === 0
+    ? 0
+    : (pagination.page - 1) * pagination.page_size + 1;
 
+const recordsRangeEnd =
+  pagination.total_records === 0
+    ? 0
+    : Math.min(pagination.page * pagination.page_size, pagination.total_records);
   const statusChart = useMemo(() => buildStatusChart(chartRecords), [chartRecords]);
 
   const chartConfig = useMemo<ChartConfig>(() => {
@@ -710,19 +732,6 @@ export default function Dashboard() {
   const availableStatuses = statsSummary.status_counts.map((item) => item.status);
   const hasActiveStatusFilter = tableSelectedStatuses.length > 0;
   const StatusFilterIcon = hasActiveStatusFilter ? FunnelPlus : Funnel;
-  const activeFilterChips = [
-    selectedDialer !== "all" ? selectedDialerLabel : null,
-    ...tableSelectedStatuses.map((status) => prettifyStatusLabel(status)),
-  ].filter(Boolean) as string[];
-  const recordsRangeStart =
-    pagination.total_records === 0 ? 0 : (pagination.page - 1) * pagination.page_size + 1;
-  const recordsRangeEnd =
-    pagination.total_records === 0
-      ? 0
-      : Math.min(
-          pagination.page * pagination.page_size,
-          pagination.total_records
-        );
 
   const toggleStatusFilter = (status: string, checked: boolean) => {
     setTableSelectedStatuses((current) => {
@@ -990,7 +999,21 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-full bg-[radial-gradient(circle_at_top_left,rgba(15,118,110,0.08),transparent_28%),radial-gradient(circle_at_top_right,rgba(37,99,235,0.08),transparent_26%)] px-4 py-6 text-foreground sm:px-6 sm:py-8">
-      <div className="mx-auto max-w-7xl space-y-6">
+      <style>
+        {`
+          @keyframes liveTileGlow {
+            0%, 100% {
+              transform: translateY(0);
+              filter: brightness(1);
+            }
+            50% {
+              transform: translateY(-1px);
+              filter: brightness(1.06);
+            }
+          }
+        `}
+      </style>
+      <div className="mx-auto max-w-7xl space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-2 motion-safe:duration-500">
         <div className="sticky top-0 z-20" ref={stickyControlsRef}>
           <div
             className={cn(
@@ -1000,7 +1023,7 @@ export default function Dashboard() {
           />
           <div
             className={cn(
-              "border border-border/70 bg-background/75 p-3 shadow-sm backdrop-blur-3xl backdrop-saturate-150 transition-all duration-300 ease-out supports-[backdrop-filter]:bg-background/60 dark:border-white/10",
+              "border border-border/45 bg-background/75 p-3 shadow-sm backdrop-blur-3xl backdrop-saturate-150 transition-all duration-300 ease-out supports-[backdrop-filter]:bg-background/60 dark:border-white/8",
               controlsJoined
                 ? "rounded-t-none border-t-transparent bg-background/80 shadow-md supports-[backdrop-filter]:bg-background/65"
                 : "rounded-2xl"
@@ -1013,7 +1036,7 @@ export default function Dashboard() {
                   setDraftDateRange(appliedDateRange);
                   setIsDateDialogOpen(true);
                 }}
-                className="group flex min-h-14 items-center justify-between rounded-xl border border-border/70 bg-background/75 px-4 py-3 text-left backdrop-blur-xl transition-colors duration-200 hover:border-primary/50 hover:bg-accent/40 dark:border-white/10"
+                className="group flex min-h-14 items-center justify-between rounded-xl border border-border/45 bg-background/75 px-4 py-3 text-left backdrop-blur-xl transition-colors duration-200 hover:border-primary/50 hover:bg-accent/40 dark:border-white/8"
               >
                 <div className="space-y-1">
                   <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
@@ -1033,7 +1056,7 @@ export default function Dashboard() {
                 <Select value={selectedDialer} onValueChange={setSelectedDialer}>
                   <SelectTrigger
                     id="sticky-dialer-select"
-                    className="h-14 rounded-xl border-border/70 bg-background/75 px-4 text-left backdrop-blur-xl dark:border-white/10"
+                    className="h-14 rounded-xl border-border/45 bg-background/75 px-4 text-left backdrop-blur-xl dark:border-white/8"
                   >
                     <SelectValue placeholder="All" />
                   </SelectTrigger>
@@ -1049,7 +1072,7 @@ export default function Dashboard() {
               </div>
 
               <div className="flex items-end">
-                <div className="flex h-14 min-w-[170px] items-center gap-3 rounded-xl border border-border/70 bg-background/75 px-4 backdrop-blur-xl dark:border-white/10">
+                <div className="flex h-14 min-w-[170px] items-center gap-3 rounded-xl border border-border/45 bg-background/75 px-4 backdrop-blur-xl dark:border-white/8">
                   <div className="space-y-0.5">
                     <p className="text-sm font-medium">Auto refresh</p>
                     <p className="text-xs text-muted-foreground">5 seconds</p>
@@ -1065,13 +1088,13 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <Card className="border-border/70 bg-card/95 shadow-sm dark:border-white/10">
+        <Card className="border-border/45 bg-card/94 dark:border-white/8">
           <CardHeader className="space-y-2">
             <CardTitle className="text-lg">Scope</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-4 md:grid-cols-3">
-              <Card className="border-border/70 bg-background/70 shadow-none dark:border-white/10">
+              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
                 <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
                   <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                     Active Scope
@@ -1089,7 +1112,7 @@ export default function Dashboard() {
                   )}
                 </CardContent>
               </Card>
-              <Card className="border-border/70 bg-background/70 shadow-none dark:border-white/10">
+              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
                 <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
                   <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                     Calls
@@ -1107,7 +1130,7 @@ export default function Dashboard() {
                   )}
                 </CardContent>
               </Card>
-              <Card className="border-border/70 bg-background/70 shadow-none dark:border-white/10">
+              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
                 <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
                   <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                     Latest Match
@@ -1286,8 +1309,12 @@ export default function Dashboard() {
                       return (
                         <div
                           key={statusItem.status}
-                          className="rounded-xl border px-5 py-4 text-left transition-transform duration-200 hover:-translate-y-0.5"
-                          style={getStatusCardStyle(statusColor)}
+                          className="relative rounded-xl border px-5 py-4 text-left transition-transform duration-200 hover:-translate-y-0.5"
+                          style={
+                            statusItem.status.trim().toLowerCase() === "live"
+                              ? getAnimatedLiveStatusCardStyle(statusColor)
+                              : getStatusCardStyle(statusColor)
+                          }
                         >
                           <button
                             type="button"
@@ -1295,12 +1322,14 @@ export default function Dashboard() {
                             className="block w-full text-left"
                             aria-label={`Filter table by ${prettifyStatusLabel(statusItem.status)}`}
                           >
-                          <p
-                            className="text-xs uppercase tracking-[0.16em]"
-                            style={{ color: tileTextColor, opacity: 0.92 }}
-                          >
-                            {prettifyStatusLabel(statusItem.status)}
-                          </p>
+                          <div className="flex items-center gap-2">
+                            <p
+                              className="text-xs uppercase tracking-[0.16em]"
+                              style={{ color: tileTextColor, opacity: 0.92 }}
+                            >
+                              {prettifyStatusLabel(statusItem.status)}
+                            </p>
+                          </div>
                           <p
                             className="mt-3 text-4xl font-semibold tracking-tight"
                             style={{ color: tileTextColor }}
@@ -1691,12 +1720,20 @@ export default function Dashboard() {
                               {formatSimplifiedTimestamp(record.created_at)}
                             </TableCell>
                             <TableCell>
-                              <span
-                                className="inline-flex rounded-full border px-3 py-1 text-xs font-medium"
-                                style={getStatusPillStyle(statusColor)}
-                              >
-                                {prettifyStatusLabel(record.status)}
-                              </span>
+                              <div className="inline-flex items-center gap-2">
+                                {record.status.trim().toLowerCase() === "live" ? (
+                                  <span className="relative flex h-2.5 w-2.5 shrink-0">
+                                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/70" />
+                                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
+                                  </span>
+                                ) : null}
+                                <span
+                                  className="inline-flex rounded-full border px-3 py-1 text-xs font-medium"
+                                  style={getStatusPillStyle(statusColor)}
+                                >
+                                  {prettifyStatusLabel(record.status)}
+                                </span>
+                              </div>
                             </TableCell>
                             <TableCell className="font-mono tabular-nums">
                               {formatDurationValue(record.duration)}

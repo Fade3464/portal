@@ -148,10 +148,14 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles" 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+CALL_RECORDINGS_BASE_URL = os.getenv("CALL_RECORDINGS_BASE_URL", "").strip().rstrip("/")
+CALL_RECORDINGS_FILE_EXTENSION = (
+    os.getenv("CALL_RECORDINGS_FILE_EXTENSION", "wav").strip().lstrip(".") or "wav"
+)
 
 
 # Default primary key field type

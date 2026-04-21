@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, ShieldCheck, UserRound } from "lucide-react";
+import { ArrowRight, CheckCircle2, Fingerprint, Mail, ShieldCheck, Smartphone, UserRound } from "lucide-react";
+import QRCode from "qrcode";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -7,12 +8,16 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import {
+  InputOTP,
+  InputOTPGroup,
+  InputOTPSlot,
+} from "@/components/ui/input-otp";
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
 import { SpinnerCustom } from "@/components/ui/spinner";
@@ -25,8 +30,8 @@ type AccountProfile = {
   display_name: string;
   username: string;
   email: string;
-  backup_email: string;
   client_name: string;
+  recovery_authenticator_enabled: boolean;
 };
 
 type AccountResponse = {
@@ -42,14 +47,22 @@ type PasswordResponse = {
   error?: string;
 };
 
+type AuthenticatorSetupResponse = {
+  status_code: number;
+  message?: string;
+  setup_key?: string;
+  otpauth_url?: string;
+  error?: string;
+};
+
 const emptyProfile: AccountProfile = {
   first_name: "",
   last_name: "",
   display_name: "",
   username: "",
   email: "",
-  backup_email: "",
   client_name: "",
+  recovery_authenticator_enabled: false,
 };
 
 function getPasswordStrengthLabel(password: string) {
@@ -93,7 +106,6 @@ export default function AccountPage() {
     first_name: "",
     last_name: "",
     email: "",
-    backup_email: "",
   });
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordForm, setPasswordForm] = useState({
@@ -107,6 +119,11 @@ export default function AccountPage() {
   const [savingProfile, setSavingProfile] = useState(false);
   const [verifyingCurrentPassword, setVerifyingCurrentPassword] = useState(false);
   const [savingPassword, setSavingPassword] = useState(false);
+  const [authenticatorOtpAuthUrl, setAuthenticatorOtpAuthUrl] = useState("");
+  const [authenticatorQrCodeDataUrl, setAuthenticatorQrCodeDataUrl] = useState("");
+  const [authenticatorOtp, setAuthenticatorOtp] = useState("");
+  const [startingAuthenticatorSetup, setStartingAuthenticatorSetup] = useState(false);
+  const [verifyingAuthenticator, setVerifyingAuthenticator] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -131,7 +148,6 @@ export default function AccountPage() {
           first_name: data.profile.first_name,
           last_name: data.profile.last_name,
           email: data.profile.email,
-          backup_email: data.profile.backup_email,
         });
       } catch (error) {
         toast.error(
@@ -150,6 +166,40 @@ export default function AccountPage() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    async function generateQrCode() {
+      if (!authenticatorOtpAuthUrl) {
+        setAuthenticatorQrCodeDataUrl("");
+        return;
+      }
+
+      try {
+        const dataUrl = await QRCode.toDataURL(authenticatorOtpAuthUrl, {
+          width: 220,
+          margin: 1,
+          errorCorrectionLevel: "M",
+        });
+
+        if (active) {
+          setAuthenticatorQrCodeDataUrl(dataUrl);
+        }
+      } catch {
+        if (active) {
+          setAuthenticatorQrCodeDataUrl("");
+          toast.error("Unable to render authenticator QR code.");
+        }
+      }
+    }
+
+    void generateQrCode();
+
+    return () => {
+      active = false;
+    };
+  }, [authenticatorOtpAuthUrl]);
 
   const passwordStrength = useMemo(
     () => getPasswordStrengthLabel(passwordForm.new_password),
@@ -200,7 +250,6 @@ export default function AccountPage() {
         first_name: data.profile.first_name,
         last_name: data.profile.last_name,
         email: data.profile.email,
-        backup_email: data.profile.backup_email,
       });
       setConfirmPassword("");
       setSaveModalOpen(false);
@@ -311,6 +360,75 @@ export default function AccountPage() {
     }
   };
 
+  const handleStartAuthenticatorSetup = async () => {
+    try {
+      setStartingAuthenticatorSetup(true);
+
+      const res = await fetch("/api/account/recovery-authenticator/setup/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": getCsrfToken(),
+        },
+        credentials: "include",
+        body: JSON.stringify({}),
+      });
+      const data: AuthenticatorSetupResponse = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to start authenticator setup.");
+      }
+
+      setAuthenticatorOtpAuthUrl(data.otpauth_url || "");
+      setAuthenticatorOtp("");
+      toast.success(data.message || "Authenticator setup started.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to start authenticator setup."
+      );
+    } finally {
+      setStartingAuthenticatorSetup(false);
+    }
+  };
+
+  const handleVerifyAuthenticator = async () => {
+    try {
+      setVerifyingAuthenticator(true);
+
+      const res = await fetch("/api/account/recovery-authenticator/verify/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": getCsrfToken(),
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          otp: authenticatorOtp,
+        }),
+      });
+      const data: PasswordResponse = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to verify authenticator.");
+      }
+
+      setProfile((current) => ({
+        ...current,
+        recovery_authenticator_enabled: true,
+      }));
+      setAuthenticatorOtpAuthUrl("");
+      setAuthenticatorQrCodeDataUrl("");
+      setAuthenticatorOtp("");
+      toast.success(data.message || "Recovery authenticator enabled.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to verify authenticator."
+      );
+    } finally {
+      setVerifyingAuthenticator(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -321,8 +439,8 @@ export default function AccountPage() {
 
   return (
     <>
-      <div className="space-y-6 p-6 md:p-8">
-        <Card className="overflow-hidden rounded-3xl border-border/70 bg-card/90 shadow-sm dark:border-white/10">
+      <div className="space-y-6 p-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-2 motion-safe:duration-500 md:p-8">
+        <Card className="overflow-hidden rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
           <CardContent className="flex flex-col gap-6 p-6 md:flex-row md:items-end md:justify-between">
             <div className="space-y-2">
               <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
@@ -336,15 +454,17 @@ export default function AccountPage() {
 
             <div className="grid gap-4 text-sm sm:grid-cols-2">
               <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
-                <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                  <Fingerprint className="h-3.5 w-3.5" />
                   Username
-                </p>
+                </div>
                 <p className="mt-1 font-medium">{profile.username}</p>
               </div>
               <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
-                <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                  <Mail className="h-3.5 w-3.5" />
                   Client
-                </p>
+                </div>
                 <p className="mt-1 font-medium">{profile.client_name}</p>
               </div>
             </div>
@@ -352,7 +472,7 @@ export default function AccountPage() {
         </Card>
 
         <div className="grid gap-6 xl:grid-cols-[1.2fr_0.9fr]">
-          <Card className="rounded-3xl border-border/70 bg-card/90 shadow-sm dark:border-white/10">
+          <Card className="rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
             <CardHeader className="pb-4">
               <CardTitle className="text-xl">Personal Information</CardTitle>
             </CardHeader>
@@ -393,19 +513,6 @@ export default function AccountPage() {
                 />
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="backup-email">Backup Email</Label>
-                <Input
-                  id="backup-email"
-                  type="email"
-                  value={form.backup_email}
-                  onChange={(event) =>
-                    handleProfileChange("backup_email", event.target.value)
-                  }
-                  placeholder="Optional"
-                />
-              </div>
-
               <div className="flex justify-end">
                 <Button
                   type="button"
@@ -419,7 +526,7 @@ export default function AccountPage() {
             </CardContent>
           </Card>
 
-          <Card className="rounded-3xl border-border/70 bg-card/90 shadow-sm dark:border-white/10">
+          <Card className="rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
             <CardHeader className="pb-4">
               <div className="flex items-center gap-3">
                 <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
@@ -562,15 +669,125 @@ export default function AccountPage() {
             </CardContent>
           </Card>
         </div>
+
+        <Card className="rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
+          <CardHeader className="pb-4">
+            <div className="flex items-center gap-3">
+              <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <Smartphone className="h-5 w-5" />
+              </div>
+              <CardTitle className="text-xl">Recovery Authenticator</CardTitle>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-5">
+            {profile.recovery_authenticator_enabled ? (
+              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.08] px-5 py-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] dark:bg-black">
+                <div className="flex items-center gap-4">
+                  <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/12 text-emerald-700 dark:bg-white/8 dark:text-white">
+                    <Smartphone className="h-5 w-5" />
+                  </div>
+                  <div className="space-y-3">
+                    <p className="text-2xl font-semibold tracking-tight text-foreground dark:text-white">
+                      Recovery Authenticator
+                    </p>
+                    <div className="inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">
+                      Enabled
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">
+                    Not enabled
+                  </div>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void handleStartAuthenticatorSetup()}
+                    disabled={startingAuthenticatorSetup}
+                    className="dark:border-white/10"
+                  >
+                    {startingAuthenticatorSetup ? "Preparing..." : "Set Up Authenticator"}
+                  </Button>
+                </div>
+
+                {authenticatorOtpAuthUrl ? (
+              <div className="space-y-4 rounded-2xl border border-border/70 bg-background/60 p-4 dark:border-white/10">
+                <div className="flex justify-center">
+                  <div className="rounded-2xl border border-border/70 bg-white p-4 shadow-sm dark:border-white/10">
+                    {authenticatorQrCodeDataUrl ? (
+                      <img
+                        src={authenticatorQrCodeDataUrl}
+                        alt="Google Authenticator setup QR code"
+                        className="h-[220px] w-[220px]"
+                      />
+                    ) : (
+                      <div className="flex h-[220px] w-[220px] items-center justify-center">
+                        <SpinnerCustom />
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Method
+                    </p>
+                    <p className="mt-2 font-medium">Google Authenticator</p>
+                  </div>
+                  <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Code
+                    </p>
+                    <p className="mt-2 font-medium">6 digits</p>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="authenticator-otp">Authenticator Code</Label>
+                  <InputOTP
+                    id="authenticator-otp"
+                    maxLength={6}
+                    value={authenticatorOtp}
+                    onChange={(value) => setAuthenticatorOtp(value)}
+                    pattern="^[0-9]+$"
+                  >
+                    <InputOTPGroup>
+                      <InputOTPSlot index={0} />
+                      <InputOTPSlot index={1} />
+                      <InputOTPSlot index={2} />
+                      <InputOTPSlot index={3} />
+                      <InputOTPSlot index={4} />
+                      <InputOTPSlot index={5} />
+                    </InputOTPGroup>
+                  </InputOTP>
+                </div>
+
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    onClick={() => void handleVerifyAuthenticator()}
+                    disabled={verifyingAuthenticator || authenticatorOtp.trim().length !== 6}
+                  >
+                    {verifyingAuthenticator ? "Verifying..." : "Verify & Enable"}
+                  </Button>
+                </div>
+              </div>
+                ) : null}
+              </>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       <Dialog open={saveModalOpen} onOpenChange={setSaveModalOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Confirm Changes</DialogTitle>
-            <DialogDescription>
-              Enter your current password to save these account updates.
-            </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-2">

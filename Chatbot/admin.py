@@ -5,8 +5,8 @@ from .models import BlacklistedNumbers, CallLog, Client, Dialer, RESTAPITOKENS
 
 @admin.register(Client)
 class ClientAdmin(admin.ModelAdmin):
-    list_display = ("client_name", "user", "email", "backup_email")
-    search_fields = ("client_name", "user__username", "user__email", "backup_email")
+    list_display = ("client_name", "user", "email")
+    search_fields = ("client_name", "user__username", "user__email")
 
 
 @admin.register(Dialer)
