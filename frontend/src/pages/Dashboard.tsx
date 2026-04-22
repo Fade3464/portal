@@ -244,10 +244,8 @@ function zonedDateTimeStringToUtcIso(value: string, timeZone: string) {
     0
   );
 
-  for (let index = 0; index < 2; index += 1) {
-    const offset = getTimeZoneOffsetMs(new Date(utcGuess), timeZone);
-    utcGuess -= offset;
-  }
+  const offset = getTimeZoneOffsetMs(new Date(utcGuess), timeZone);
+  utcGuess -= offset;
 
   return new Date(utcGuess).toISOString();
 }

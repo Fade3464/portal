@@ -7,6 +7,7 @@ import json
 import os
 import random
 import struct
+from threading import Lock
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -37,6 +38,11 @@ PASSWORD_RESET_SALT = "chatbot-forgot-password-v1"
 TOTP_ISSUER = "Portal"
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_LOCKOUT_SECONDS = 3600
+LIVE_STATUS_TIMEOUT_SECONDS = 200
+LIVE_STATUS_EXPIRED_VALUE = "DROP"
+LIVE_STATUS_ACTIVE_VALUE = "LIVE"
+_live_status_expiry_lock = Lock()
+_last_live_status_expiry_check = 0.0
 
 
 def _get_user_display_name(user):
@@ -180,6 +186,26 @@ def _clear_failed_login_attempts(ip_address):
         last_failed_at=None,
         locked_until=None,
     )
+
+
+def _expire_stale_live_call_logs():
+    global _last_live_status_expiry_check
+
+    now_monotonic = time.monotonic()
+    if now_monotonic - _last_live_status_expiry_check < 30:
+        return
+
+    with _live_status_expiry_lock:
+        now_monotonic = time.monotonic()
+        if now_monotonic - _last_live_status_expiry_check < 30:
+            return
+
+        expiry_cutoff = timezone.now() - timedelta(seconds=LIVE_STATUS_TIMEOUT_SECONDS)
+        CallLog.objects.filter(
+            status__iexact=LIVE_STATUS_ACTIVE_VALUE,
+            created_at__lte=expiry_cutoff,
+        ).update(status=LIVE_STATUS_EXPIRED_VALUE)
+        _last_live_status_expiry_check = now_monotonic
 
 
 def _extract_api_token(request):
@@ -934,6 +960,7 @@ def forgot_password_reset_view(request):
 
 @require_GET
 def preload_dialer_routes_view(request):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -959,6 +986,7 @@ def preload_dialer_routes_view(request):
 @csrf_exempt
 @require_POST
 def request_route_view(request):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1007,6 +1035,7 @@ def request_route_view(request):
 @csrf_exempt
 @require_POST
 def check_batchnflow_view(request):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1044,6 +1073,7 @@ def check_batchnflow_view(request):
 @csrf_exempt
 @require_POST
 def create_call_log_view(request):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1096,6 +1126,7 @@ def create_call_log_view(request):
 @csrf_exempt
 @require_http_methods(["PATCH", "POST"])
 def update_call_log_view(request, call_uuid):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1176,6 +1207,7 @@ def update_call_log_view(request, call_uuid):
 
 @require_GET
 def check_blacklisted_number_view(request, call_id):
+    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1193,6 +1225,7 @@ def check_blacklisted_number_view(request, call_id):
 
 @require_GET
 def dashboard_filters_view(request):
+    _expire_stale_live_call_logs()
     client, error_response = _get_authenticated_client(request)
     if error_response:
         return error_response
@@ -1457,6 +1490,7 @@ def dashboard_filters_view(request):
 
 @require_GET
 def call_log_search_view(request):
+    _expire_stale_live_call_logs()
     client, error_response = _get_authenticated_client(request)
     if error_response:
         return error_response
