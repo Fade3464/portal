@@ -16,11 +16,13 @@ from django.views.decorators.csrf import csrf_exempt
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core import signing
 from django.core.validators import URLValidator, validate_email
 from django.db import transaction
 from django.db.models import Avg, Count, Sum
+from django.db.models.functions import TruncDay, TruncHour, TruncMinute, TruncMonth
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils import timezone
@@ -43,6 +45,8 @@ LIVE_STATUS_EXPIRED_VALUE = "DROP"
 LIVE_STATUS_ACTIVE_VALUE = "LIVE"
 _live_status_expiry_lock = Lock()
 _last_live_status_expiry_check = 0.0
+DASHBOARD_TABLE_CACHE_TTL_SECONDS = 5
+DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 20
 
 
 def _get_user_display_name(user):
@@ -485,6 +489,13 @@ def _get_today_range():
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     return start_of_day, end_of_day
+
+
+def _build_dashboard_cache_key(namespace, cache_payload):
+    digest = hashlib.sha256(
+        json.dumps(cache_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"{namespace}:{digest}"
 
 
 def _serialize_account_profile(client):
@@ -1224,11 +1235,10 @@ def check_blacklisted_number_view(request, call_id):
 
 
 @require_GET
-def dashboard_filters_view(request):
-    _expire_stale_live_call_logs()
+def _get_dashboard_scope(request):
     client, error_response = _get_authenticated_client(request)
     if error_response:
-        return error_response
+        return None, error_response
 
     active_dialers = list(
         Dialer.objects.filter(client=client, active=True)
@@ -1237,19 +1247,170 @@ def dashboard_filters_view(request):
     )
 
     selected_dialer_id = request.GET.get("dialer_id")
+    date_from = request.GET.get("date_from")
+    date_to = request.GET.get("date_to")
+
+    try:
+        start_at = _normalize_datetime_param(date_from)
+        end_at = _normalize_datetime_param(date_to)
+    except ValueError as exc:
+        return None, _json_error(str(exc), status=400)
+
+    if start_at is None and end_at is None:
+        start_at, end_at = _get_today_range()
+
+    if start_at and end_at and start_at > end_at:
+        return None, _json_error("The from date must be earlier than the to date.", status=400)
+
+    active_dialer_lookup = {
+        dialer["id"]: dialer["dialer_name"]
+        for dialer in active_dialers
+    }
+    active_dialer_ids = list(active_dialer_lookup.keys())
+
+    normalized_dialer_id = None
+    selected_dialer = None
+    if selected_dialer_id and selected_dialer_id.lower() != "all":
+        try:
+            normalized_dialer_id = int(selected_dialer_id)
+        except ValueError:
+            return None, _json_error("dialer_id must be an integer or 'all'.", status=400)
+
+        selected_dialer_name = active_dialer_lookup.get(normalized_dialer_id)
+        if selected_dialer_name is None:
+            return None, _json_error("The selected dialer is not available for this client.", status=404)
+
+        selected_dialer = {
+            "id": normalized_dialer_id,
+            "dialer_name": selected_dialer_name,
+        }
+        active_dialer_ids = [normalized_dialer_id]
+
+    return {
+        "client": client,
+        "active_dialers": active_dialers,
+        "active_dialer_lookup": active_dialer_lookup,
+        "active_dialer_ids": active_dialer_ids,
+        "normalized_dialer_id": normalized_dialer_id,
+        "selected_dialer_name": selected_dialer["dialer_name"] if selected_dialer else "All",
+        "start_at": start_at,
+        "end_at": end_at,
+    }, None
+
+
+def _build_dashboard_filters_payload(scope, table_statuses=None):
+    return {
+        "dialer_id": scope["normalized_dialer_id"],
+        "dialer_name": scope["selected_dialer_name"],
+        "table_statuses": table_statuses or [],
+        "date_from": scope["start_at"].isoformat() if scope["start_at"] else None,
+        "date_to": scope["end_at"].isoformat() if scope["end_at"] else None,
+    }
+
+
+def _build_dashboard_base_queryset(scope):
+    filtered_logs = CallLog.objects.filter(dialer_id__in=scope["active_dialer_ids"])
+
+    if scope["start_at"]:
+        filtered_logs = filtered_logs.filter(created_at__gte=scope["start_at"])
+
+    if scope["end_at"]:
+        filtered_logs = filtered_logs.filter(created_at__lte=scope["end_at"])
+
+    return filtered_logs
+
+
+def _build_dashboard_status_chart(filtered_logs, start_at, end_at):
+    if start_at and end_at:
+        span = end_at - start_at
+    else:
+        span = timedelta(days=1)
+
+    if span <= timedelta(hours=6):
+        bucket_trunc = TruncMinute
+        bucket_label = "Time"
+        label_format = "%I:%M %p"
+    elif span <= timedelta(days=3):
+        bucket_trunc = TruncHour
+        bucket_label = "Time"
+        label_format = "%b %d, %I:%M %p"
+    elif span <= timedelta(days=120):
+        bucket_trunc = TruncDay
+        bucket_label = "Date"
+        label_format = "%b %d"
+    else:
+        bucket_trunc = TruncMonth
+        bucket_label = "Period"
+        label_format = "%b %Y"
+
+    chart_rows = list(
+        filtered_logs.annotate(bucket=bucket_trunc("created_at"))
+        .values("bucket", "status")
+        .annotate(count=Count("id"))
+        .order_by("bucket", "status")
+    )
+
+    if not chart_rows:
+        return {
+            "bucket_label": bucket_label,
+            "statuses": [],
+            "series": [],
+        }
+
+    status_totals = {}
+    bucket_lookup = {}
+
+    for row in chart_rows:
+        bucket = row["bucket"]
+        status = row["status"] or "unknown"
+        count = row["count"]
+        status_totals[status] = status_totals.get(status, 0) + count
+
+        if bucket not in bucket_lookup:
+            local_bucket = timezone.localtime(bucket)
+            bucket_lookup[bucket] = {
+                "bucket": local_bucket.isoformat(),
+                "label": local_bucket.strftime(label_format),
+            }
+
+        bucket_lookup[bucket][status] = count
+
+    statuses = [
+        status
+        for status, _ in sorted(
+            status_totals.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    series = []
+    for bucket in sorted(bucket_lookup.keys()):
+        row = bucket_lookup[bucket]
+        for status in statuses:
+            row.setdefault(status, 0)
+        series.append(row)
+
+    return {
+        "bucket_label": bucket_label,
+        "statuses": statuses,
+        "series": series,
+    }
+
+
+@require_GET
+def dashboard_filters_view(request):
+    scope, error_response = _get_dashboard_scope(request)
+    if error_response:
+        return error_response
+
     table_selected_statuses = [
         status.strip()
         for status in request.GET.getlist("table_status")
         if status and status.strip()
     ]
-    date_from = request.GET.get("date_from")
-    date_to = request.GET.get("date_to")
     page = request.GET.get("page", "1")
     page_size = request.GET.get("page_size", "10")
 
     try:
-        start_at = _normalize_datetime_param(date_from)
-        end_at = _normalize_datetime_param(date_to)
         page_number = int(page)
         page_size_number = int(page_size)
     except ValueError as exc:
@@ -1261,90 +1422,181 @@ def dashboard_filters_view(request):
     if page_size_number < 1 or page_size_number > 100:
         return _json_error("page_size must be between 1 and 100.", status=400)
 
-    if start_at is None and end_at is None:
-        start_at, end_at = _get_today_range()
-
-    if start_at and end_at and start_at > end_at:
-        return _json_error("The from date must be earlier than the to date.", status=400)
-
-    filtered_logs = CallLog.objects.filter(
-        dialer__client=client,
-        dialer__active=True,
+    dashboard_cache_key = _build_dashboard_cache_key(
+        "dashboard_table",
+        {
+            "client_id": scope["client"].id,
+            "dialer_id": scope["normalized_dialer_id"],
+            "table_statuses": sorted(table_selected_statuses),
+            "date_from": scope["start_at"].isoformat() if scope["start_at"] else None,
+            "date_to": scope["end_at"].isoformat() if scope["end_at"] else None,
+            "page": page_number,
+            "page_size": page_size_number,
+        },
     )
+    cached_dashboard_payload = cache.get(dashboard_cache_key)
+    if cached_dashboard_payload is not None:
+        return _json_response(cached_dashboard_payload)
 
-    normalized_dialer_id = None
-    selected_dialer = None
-    if selected_dialer_id and selected_dialer_id.lower() != "all":
-        try:
-            normalized_dialer_id = int(selected_dialer_id)
-        except ValueError:
-            return _json_error("dialer_id must be an integer or 'all'.", status=400)
+    if not scope["active_dialer_ids"]:
+        response_payload = {
+            "dialers": scope["active_dialers"],
+            "filters": _build_dashboard_filters_payload(scope, table_selected_statuses),
+            "results": {
+                "records": [],
+                "pagination": {
+                    "page": 1,
+                    "page_size": page_size_number,
+                    "total_pages": 1,
+                    "total_records": 0,
+                },
+            },
+        }
+        cache.set(dashboard_cache_key, response_payload, DASHBOARD_TABLE_CACHE_TTL_SECONDS)
+        return _json_response(response_payload)
 
-        selected_dialer = (
-            Dialer.objects.filter(
-                id=normalized_dialer_id,
-                client=client,
-                active=True,
-            )
-            .only("id", "dialer_name")
-            .first()
-        )
-        if selected_dialer is None:
-            return _json_error("The selected dialer is not available for this client.", status=404)
-
-        filtered_logs = filtered_logs.filter(dialer_id=normalized_dialer_id)
-
-    if start_at:
-        filtered_logs = filtered_logs.filter(created_at__gte=start_at)
-
-    if end_at:
-        filtered_logs = filtered_logs.filter(created_at__lte=end_at)
-
-    total_count = filtered_logs.count()
+    filtered_logs = _build_dashboard_base_queryset(scope)
     table_logs = filtered_logs
     if table_selected_statuses:
         table_logs = table_logs.filter(status__in=table_selected_statuses)
 
-    duration_summary = filtered_logs.aggregate(
-        avg_duration=Avg("duration"),
-        total_duration=Sum("duration"),
-    )
-    status_summary_rows = list(
-        filtered_logs.values("status")
-        .annotate(count=Count("id"))
-        .order_by("-count", "status")
-    )
-    status_matrix_rows = list(
-        filtered_logs.values("dialer__id", "dialer__dialer_name", "status")
-        .annotate(count=Count("id"))
-        .order_by("dialer__dialer_name", "status")
-    )
     table_total_count = table_logs.count()
     total_pages = max((table_total_count + page_size_number - 1) // page_size_number, 1)
     effective_page = min(page_number, total_pages)
     offset = (effective_page - 1) * page_size_number
     paginated_logs = list(
-        table_logs.select_related("dialer")
-        .order_by("-created_at", "-id")[offset : offset + page_size_number]
-    )
-    chart_records = list(
-        filtered_logs.order_by("created_at", "id").values("created_at", "status")
-    )
-    breakdown_rows = list(
-        filtered_logs.values(
-            "dialer__id",
-            "dialer__dialer_name",
+        table_logs.order_by("-created_at", "-id")
+        .values(
+            "call_uuid",
+            "call_id",
+            "dialer_id",
+            "status",
+            "state",
             "flow",
             "batch",
+            "duration",
+            "call_recording_link",
+            "created_at",
+        )[offset : offset + page_size_number]
+    )
+
+    response_payload = {
+        "dialers": scope["active_dialers"],
+        "filters": _build_dashboard_filters_payload(scope, table_selected_statuses),
+        "results": {
+            "records": [
+                {
+                    "call_uuid": str(call_log["call_uuid"]),
+                    "call_id": call_log["call_id"],
+                    "dialer_id": call_log["dialer_id"],
+                    "dialer_name": scope["active_dialer_lookup"].get(call_log["dialer_id"], ""),
+                    "status": call_log["status"],
+                    "state": call_log["state"],
+                    "flow": call_log["flow"],
+                    "batch": call_log["batch"],
+                    "duration": call_log["duration"],
+                    "call_recording_link": call_log["call_recording_link"],
+                    "created_at": call_log["created_at"].isoformat(),
+                }
+                for call_log in paginated_logs
+            ],
+            "pagination": {
+                "page": effective_page,
+                "page_size": page_size_number,
+                "total_pages": total_pages,
+                "total_records": table_total_count,
+            },
+        },
+    }
+    cache.set(dashboard_cache_key, response_payload, DASHBOARD_TABLE_CACHE_TTL_SECONDS)
+    return _json_response(response_payload)
+
+
+@require_GET
+def dashboard_analytics_view(request):
+    scope, error_response = _get_dashboard_scope(request)
+    if error_response:
+        return error_response
+
+    dashboard_cache_key = _build_dashboard_cache_key(
+        "dashboard_analytics",
+        {
+            "client_id": scope["client"].id,
+            "dialer_id": scope["normalized_dialer_id"],
+            "date_from": scope["start_at"].isoformat() if scope["start_at"] else None,
+            "date_to": scope["end_at"].isoformat() if scope["end_at"] else None,
+        },
+    )
+    cached_dashboard_payload = cache.get(dashboard_cache_key)
+    if cached_dashboard_payload is not None:
+        return _json_response(cached_dashboard_payload)
+
+    if not scope["active_dialer_ids"]:
+        response_payload = {
+            "filters": _build_dashboard_filters_payload(scope),
+            "results": {
+                "total_count": 0,
+                "status_chart": {
+                    "bucket_label": "Time",
+                    "statuses": [],
+                    "series": [],
+                },
+                "stats_summary": {
+                    "total_calls": 0,
+                    "avg_duration": 0.0,
+                    "total_duration": 0,
+                    "status_counts": [],
+                },
+                "status_matrix": {
+                    "statuses": [],
+                    "rows": [],
+                },
+                "flow_breakdown": [],
+            },
+        }
+        cache.set(
+            dashboard_cache_key,
+            response_payload,
+            DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS,
         )
-        .annotate(count=Count("id"))
-        .order_by("dialer__dialer_name", "flow", "batch")
+        return _json_response(response_payload)
+
+    filtered_logs = _build_dashboard_base_queryset(scope)
+    overall_summary = filtered_logs.aggregate(
+        total_count=Count("id"),
+        avg_duration=Avg("duration"),
+        total_duration=Sum("duration"),
+    )
+    total_count = overall_summary["total_count"] or 0
+    status_summary_rows = list(
+        filtered_logs.values("status").annotate(count=Count("id"))
+    )
+    status_matrix_rows = list(
+        filtered_logs.values("dialer_id", "status").annotate(count=Count("id"))
+    )
+    breakdown_rows = list(
+        filtered_logs.values("dialer_id", "flow", "batch").annotate(count=Count("id"))
+    )
+
+    status_summary_rows.sort(key=lambda row: (-row["count"], row["status"] or ""))
+    status_matrix_rows.sort(
+        key=lambda row: (
+            scope["active_dialer_lookup"].get(row["dialer_id"], "").lower(),
+            row["status"] or "",
+        )
+    )
+    breakdown_rows.sort(
+        key=lambda row: (
+            scope["active_dialer_lookup"].get(row["dialer_id"], "").lower(),
+            row["flow"] or "",
+            row["batch"],
+        )
     )
 
     dialer_lookup = {}
     for row in breakdown_rows:
-        dialer_id = row["dialer__id"]
-        dialer_name = row["dialer__dialer_name"]
+        dialer_id = row["dialer_id"]
+        dialer_name = scope["active_dialer_lookup"].get(dialer_id, "")
         flow_name = row["flow"] or "unknown"
         batch_value = row["batch"]
         count = row["count"]
@@ -1390,14 +1642,11 @@ def dashboard_filters_view(request):
             }
         )
 
-    matrix_statuses = [
-        row["status"] or "unknown"
-        for row in status_summary_rows
-    ]
+    matrix_statuses = [row["status"] or "unknown" for row in status_summary_rows]
     status_matrix_lookup = {}
     for row in status_matrix_rows:
-        dialer_id = row["dialer__id"]
-        dialer_name = row["dialer__dialer_name"]
+        dialer_id = row["dialer_id"]
+        dialer_name = scope["active_dialer_lookup"].get(dialer_id, "")
         status_name = row["status"] or "unknown"
         count = row["count"]
 
@@ -1436,56 +1685,41 @@ def dashboard_filters_view(request):
         )
 
     status_matrix.sort(key=lambda row: row["dialer_name"].lower())
-
-    return _json_response(
-        {
-            "dialers": active_dialers,
-            "filters": {
-                "dialer_id": normalized_dialer_id,
-                "dialer_name": selected_dialer.dialer_name if selected_dialer else "All",
-                "table_statuses": table_selected_statuses,
-                "date_from": start_at.isoformat() if start_at else None,
-                "date_to": end_at.isoformat() if end_at else None,
-            },
-            "results": {
-                "total_count": total_count,
-                "records": [_serialize_call_log(call_log) for call_log in paginated_logs],
-                "pagination": {
-                    "page": effective_page,
-                    "page_size": page_size_number,
-                    "total_pages": total_pages,
-                    "total_records": table_total_count,
-                },
-                "chart_records": [
+    response_payload = {
+        "filters": _build_dashboard_filters_payload(scope),
+        "results": {
+            "total_count": total_count,
+            "status_chart": _build_dashboard_status_chart(
+                filtered_logs,
+                scope["start_at"],
+                scope["end_at"],
+            ),
+            "stats_summary": {
+                "total_calls": total_count,
+                "avg_duration": float(overall_summary["avg_duration"] or 0),
+                "total_duration": int(overall_summary["total_duration"] or 0),
+                "status_counts": [
                     {
-                        "created_at": timezone.localtime(record["created_at"]).isoformat(),
-                        "status": record["status"] or "unknown",
+                        "status": row["status"] or "unknown",
+                        "count": row["count"],
+                        "percentage": (row["count"] / total_count * 100) if total_count else 0,
                     }
-                    for record in chart_records
+                    for row in status_summary_rows
                 ],
-                "stats_summary": {
-                    "total_calls": total_count,
-                    "avg_duration": float(duration_summary["avg_duration"] or 0),
-                    "total_duration": int(duration_summary["total_duration"] or 0),
-                    "status_counts": [
-                        {
-                            "status": row["status"] or "unknown",
-                            "count": row["count"],
-                            "percentage": (row["count"] / total_count * 100)
-                            if total_count
-                            else 0,
-                        }
-                        for row in status_summary_rows
-                    ],
-                },
-                "status_matrix": {
-                    "statuses": matrix_statuses,
-                    "rows": status_matrix,
-                },
-                "flow_breakdown": flow_breakdown,
             },
-        }
+            "status_matrix": {
+                "statuses": matrix_statuses,
+                "rows": status_matrix,
+            },
+            "flow_breakdown": flow_breakdown,
+        },
+    }
+    cache.set(
+        dashboard_cache_key,
+        response_payload,
+        DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return _json_response(response_payload)
 
 
 @require_GET

@@ -12,6 +12,7 @@ from .views import (
     check_blacklisted_number_view,
     csrf_token_view,
     create_call_log_view,
+    dashboard_analytics_view,
     dashboard_filters_view,
     forgot_password_reset_view,
     forgot_password_start_view,
@@ -75,6 +76,11 @@ urlpatterns = [
         "api/dashboard/filters/",
         dashboard_filters_view,
         name="dashboard_filters",
+    ),
+    path(
+        "api/dashboard/analytics/",
+        dashboard_analytics_view,
+        name="dashboard_analytics",
     ),
     path("api/call-logs/create/", create_call_log_view, name="create_call_log"),
     path(

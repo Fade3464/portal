@@ -1,5 +1,5 @@
-import { type FormEvent, useState } from "react";
-import { PhoneCall, Search, SearchX, Waves } from "lucide-react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
+import { PhoneCall, Play, Search, SearchX, Waves } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -64,6 +64,18 @@ export default function CallLookupPage() {
   const [loading, setLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [result, setResult] = useState<CallLookupResponse | null>(null);
+  const [audioUrls, setAudioUrls] = useState<Record<string, string>>({});
+  const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
+  const [audioErrors, setAudioErrors] = useState<Record<string, string>>({});
+  const audioUrlsRef = useRef<Record<string, string>>({});
+
+  const resetAudioState = () => {
+    Object.values(audioUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    audioUrlsRef.current = {};
+    setAudioUrls({});
+    setAudioErrors({});
+    setLoadingAudioId(null);
+  };
 
   const handleSearch = async (event: FormEvent) => {
     event.preventDefault();
@@ -76,6 +88,7 @@ export default function CallLookupPage() {
     try {
       setLoading(true);
       setHasSearched(false);
+      resetAudioState();
 
       const params = new URLSearchParams({
         call_id: callId.trim(),
@@ -100,6 +113,72 @@ export default function CallLookupPage() {
       );
     } finally {
       setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    audioUrlsRef.current = audioUrls;
+  }, [audioUrls]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(audioUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
+
+  const handlePlayRecording = async (record: CallLookupRecord) => {
+    if (!record.call_recording_link) {
+      setAudioErrors((current) => ({
+        ...current,
+        [record.call_uuid]: "Recording unavailable.",
+      }));
+      return;
+    }
+
+    if (audioUrls[record.call_uuid]) {
+      return;
+    }
+
+    setLoadingAudioId(record.call_uuid);
+    setAudioErrors((current) => {
+      const next = { ...current };
+      delete next[record.call_uuid];
+      return next;
+    });
+
+    try {
+      const response = await fetch(record.call_recording_link, {
+        credentials: "include",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to load recording.");
+      }
+
+      const audioBlob = await response.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      setAudioUrls((current) => {
+        if (current[record.call_uuid]) {
+          URL.revokeObjectURL(audioUrl);
+          return current;
+        }
+
+        return {
+          ...current,
+          [record.call_uuid]: audioUrl,
+        };
+      });
+    } catch (error) {
+      setAudioErrors((current) => ({
+        ...current,
+        [record.call_uuid]:
+          error instanceof Error ? error.message : "Failed to load recording.",
+      }));
+    } finally {
+      setLoadingAudioId((current) =>
+        current === record.call_uuid ? null : current
+      );
     }
   };
 
@@ -190,6 +269,7 @@ export default function CallLookupPage() {
                         <TableHead>Flow</TableHead>
                         <TableHead>Batch</TableHead>
                         <TableHead>State</TableHead>
+                        <TableHead className="w-[140px] text-center">Recording</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -203,6 +283,44 @@ export default function CallLookupPage() {
                           <TableCell>{record.flow}</TableCell>
                           <TableCell>{record.batch}</TableCell>
                           <TableCell>{record.state || "-"}</TableCell>
+                          <TableCell className="text-center">
+                            {record.status.trim().toLowerCase() === "live" ? (
+                              <span className="text-xs text-muted-foreground">
+                                Recording available soon
+                              </span>
+                            ) : audioUrls[record.call_uuid] ? (
+                              <audio
+                                className="h-9 w-full min-w-[220px]"
+                                controls
+                                preload="none"
+                                src={audioUrls[record.call_uuid]}
+                              />
+                            ) : (
+                              <div className="flex flex-col items-center gap-1">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="icon"
+                                  onClick={() => void handlePlayRecording(record)}
+                                  disabled={loadingAudioId === record.call_uuid}
+                                  className="h-9 w-9 rounded-full border-border/70 bg-background/80 dark:border-white/10"
+                                  aria-label={`Play recording for call ${record.call_id}`}
+                                >
+                                  <Play className="h-4 w-4" />
+                                </Button>
+                                {loadingAudioId === record.call_uuid && (
+                                  <span className="text-[11px] text-muted-foreground">
+                                    Loading...
+                                  </span>
+                                )}
+                                {audioErrors[record.call_uuid] && (
+                                  <span className="text-[11px] text-destructive">
+                                    {audioErrors[record.call_uuid]}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

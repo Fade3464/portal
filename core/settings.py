@@ -100,6 +100,11 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = os.getenv("DB_PORT", "")
 DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "60"))
+CACHE_BACKEND = os.getenv(
+    "CACHE_BACKEND",
+    "django.core.cache.backends.filebased.FileBasedCache",
+)
+CACHE_LOCATION = os.getenv("CACHE_LOCATION", str(BASE_DIR / ".django_cache"))
 
 DATABASES = {
     'default': {
@@ -110,6 +115,17 @@ DATABASES = {
         'HOST': DB_HOST,
         'PORT': DB_PORT,
         'CONN_MAX_AGE': DB_CONN_MAX_AGE,
+    }
+}
+
+CACHES = {
+    "default": {
+        "BACKEND": CACHE_BACKEND,
+        "LOCATION": CACHE_LOCATION,
+        "TIMEOUT": int(os.getenv("CACHE_TIMEOUT", "300")),
+        "OPTIONS": {
+            "MAX_ENTRIES": int(os.getenv("CACHE_MAX_ENTRIES", "5000")),
+        },
     }
 }
 

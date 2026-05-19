@@ -100,18 +100,19 @@ type CallLogRecord = {
   created_at: string;
 };
 
-type DashboardResponse = {
+type DashboardFilters = {
+  dialer_id: number | null;
+  dialer_name: string;
+  table_statuses?: string[];
+  date_from: string | null;
+  date_to: string | null;
+};
+
+type DashboardTableResponse = {
   status_code: number;
   dialers: DialerOption[];
-  filters: {
-    dialer_id: number | null;
-    dialer_name: string;
-    table_statuses?: string[];
-    date_from: string | null;
-    date_to: string | null;
-  };
+  filters: DashboardFilters;
   results: {
-    total_count: number;
     records: CallLogRecord[];
     pagination: {
       page: number;
@@ -119,10 +120,23 @@ type DashboardResponse = {
       total_pages: number;
       total_records: number;
     };
-    chart_records: Array<{
-      created_at: string;
-      status: string;
-    }>;
+  };
+};
+
+type ChartPoint = Record<string, string | number>;
+
+type BuiltStatusChart = {
+  bucket_label: string;
+  statuses: string[];
+  series: ChartPoint[];
+};
+
+type DashboardAnalyticsResponse = {
+  status_code: number;
+  filters: DashboardFilters;
+  results: {
+    total_count: number;
+    status_chart: BuiltStatusChart;
     stats_summary: {
       total_calls: number;
       avg_duration: number;
@@ -169,13 +183,47 @@ type DateRangeDraft = {
   to: string;
 };
 
-type ChartPoint = Record<string, string | number>;
-
-type BuiltStatusChart = {
-  bucketLabel: string;
-  statuses: string[];
-  series: ChartPoint[];
+type DashboardPersistedState = {
+  dialers: DialerOption[];
+  records: CallLogRecord[];
+  pagination: {
+    page: number;
+    page_size: number;
+    total_pages: number;
+    total_records: number;
+  };
+  totalCount: number;
+  statusChart: BuiltStatusChart;
+  statsSummary: DashboardAnalyticsResponse["results"]["stats_summary"];
+  flowBreakdown: DashboardAnalyticsResponse["results"]["flow_breakdown"];
+  statusMatrix: DashboardAnalyticsResponse["results"]["status_matrix"];
+  selectedDialer: string;
+  tableSelectedStatuses: string[];
+  currentPage: number;
+  pageSize: string;
+  autoRefresh: boolean;
+  appliedDateRange: DateRangeDraft;
+  draftDateRange: DateRangeDraft;
 };
+
+const DASHBOARD_STORAGE_KEY = "dashboard-page-state-v1";
+
+function readDashboardPersistedState(): DashboardPersistedState | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const rawValue = window.sessionStorage.getItem(DASHBOARD_STORAGE_KEY);
+    if (!rawValue) {
+      return null;
+    }
+
+    return JSON.parse(rawValue) as DashboardPersistedState;
+  } catch {
+    return null;
+  }
+}
 
 const DASHBOARD_TIMEZONE = "America/New_York";
 
@@ -288,133 +336,6 @@ function getTodayRangeDraft(): DateRangeDraft {
   };
 }
 
-function prettifyBucketLabel(date: Date, intervalMs: number) {
-  if (intervalMs < 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat(undefined, {
-      timeZone: DASHBOARD_TIMEZONE,
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(date);
-  }
-
-  if (intervalMs < 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat(undefined, {
-      timeZone: DASHBOARD_TIMEZONE,
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(date);
-  }
-
-  if (intervalMs < 28 * 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat(undefined, {
-      timeZone: DASHBOARD_TIMEZONE,
-      month: "short",
-      day: "2-digit",
-    }).format(date);
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: DASHBOARD_TIMEZONE,
-    month: "short",
-    year: "numeric",
-  }).format(date);
-}
-
-function chooseSmartBucketSize(timestamps: number[]) {
-  if (timestamps.length <= 1) {
-    return 60 * 60 * 1000;
-  }
-
-  const sorted = [...timestamps].sort((a, b) => a - b);
-  const minTime = sorted[0];
-  const maxTime = sorted[sorted.length - 1];
-  const span = Math.max(maxTime - minTime, 1);
-  const targetBucketCount = Math.min(12, Math.max(5, Math.ceil(Math.sqrt(sorted.length) * 1.8)));
-  const desiredBucketSize = span / targetBucketCount;
-
-  const candidates = [
-    5 * 60 * 1000,
-    10 * 60 * 1000,
-    15 * 60 * 1000,
-    30 * 60 * 1000,
-    60 * 60 * 1000,
-    2 * 60 * 60 * 1000,
-    4 * 60 * 60 * 1000,
-    6 * 60 * 60 * 1000,
-    12 * 60 * 60 * 1000,
-    24 * 60 * 60 * 1000,
-    2 * 24 * 60 * 60 * 1000,
-    3 * 24 * 60 * 60 * 1000,
-    7 * 24 * 60 * 60 * 1000,
-    14 * 24 * 60 * 60 * 1000,
-    30 * 24 * 60 * 60 * 1000,
-  ];
-
-  return candidates.find((candidate) => candidate >= desiredBucketSize) ?? candidates[candidates.length - 1];
-}
-
-function buildStatusChart(records: DashboardResponse["results"]["chart_records"]): BuiltStatusChart {
-  if (records.length === 0) {
-    return {
-      bucketLabel: "Time",
-      statuses: [],
-      series: [],
-    };
-  }
-
-  const timestamps = records.map((record) => new Date(record.created_at).getTime());
-  const minTimestamp = Math.min(...timestamps);
-  const bucketSize = chooseSmartBucketSize(timestamps);
-  const statusTotals = new Map<string, number>();
-  const buckets = new Map<number, ChartPoint>();
-
-  for (const record of records) {
-    const timestamp = new Date(record.created_at).getTime();
-    const status = record.status || "unknown";
-    const bucketStart =
-      minTimestamp + Math.floor((timestamp - minTimestamp) / bucketSize) * bucketSize;
-
-    statusTotals.set(status, (statusTotals.get(status) ?? 0) + 1);
-
-    if (!buckets.has(bucketStart)) {
-      const bucketDate = new Date(bucketStart);
-      buckets.set(bucketStart, {
-        bucket: bucketStart,
-        label: prettifyBucketLabel(bucketDate, bucketSize),
-      });
-    }
-
-    const currentBucket = buckets.get(bucketStart)!;
-    currentBucket[status] = Number(currentBucket[status] ?? 0) + 1;
-  }
-
-  const statuses = [...statusTotals.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([status]) => status);
-
-  const series = [...buckets.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([, bucket]) => {
-      const row = { ...bucket };
-      for (const status of statuses) {
-        row[status] = Number(row[status] ?? 0);
-      }
-      return row;
-    });
-
-  return {
-    bucketLabel:
-      bucketSize < 24 * 60 * 60 * 1000
-        ? "Time"
-        : bucketSize < 28 * 24 * 60 * 60 * 1000
-          ? "Date"
-          : "Period",
-    statuses,
-    series,
-  };
-}
 
 const BASE_STATUS_COLORS = [
   "#0f766e",
@@ -551,41 +472,63 @@ function escapeCsvValue(value: string | number) {
 }
 
 export default function Dashboard() {
-  const [isLoading, setIsLoading] = useState(true);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const hasLoadedOnceRef = useRef(false);
+  const persistedDashboardStateRef = useRef<DashboardPersistedState | null>(
+    readDashboardPersistedState()
+  );
+  const persistedState = persistedDashboardStateRef.current;
+
+  const [isTableLoading, setIsTableLoading] = useState(!persistedState);
+  const [isAnalyticsLoading, setIsAnalyticsLoading] = useState(!persistedState);
+  const [isTableRefreshing, setIsTableRefreshing] = useState(false);
+  const [isAnalyticsRefreshing, setIsAnalyticsRefreshing] = useState(false);
+  const hasLoadedTableRef = useRef(Boolean(persistedState));
+  const hasLoadedAnalyticsRef = useRef(Boolean(persistedState));
   const [isDateDialogOpen, setIsDateDialogOpen] = useState(false);
-  const [dialers, setDialers] = useState<DialerOption[]>([]);
-  const [records, setRecords] = useState<CallLogRecord[]>([]);
+  const [dialers, setDialers] = useState<DialerOption[]>(persistedState?.dialers ?? []);
+  const [records, setRecords] = useState<CallLogRecord[]>(persistedState?.records ?? []);
   const [pagination, setPagination] = useState({
-    page: 1,
-    page_size: 10,
-    total_pages: 1,
-    total_records: 0,
+    page: persistedState?.pagination.page ?? 1,
+    page_size: persistedState?.pagination.page_size ?? 10,
+    total_pages: persistedState?.pagination.total_pages ?? 1,
+    total_records: persistedState?.pagination.total_records ?? 0,
   });
-  const [totalCount, setTotalCount] = useState(0);
-  const [chartRecords, setChartRecords] = useState<DashboardResponse["results"]["chart_records"]>([]);
-  const [statsSummary, setStatsSummary] = useState<DashboardResponse["results"]["stats_summary"]>({
-    total_calls: 0,
-    avg_duration: 0,
-    total_duration: 0,
-    status_counts: [],
+  const [totalCount, setTotalCount] = useState(persistedState?.totalCount ?? 0);
+  const [statusChart, setStatusChart] = useState<BuiltStatusChart>(
+    persistedState?.statusChart ?? {
+      bucket_label: "Time",
+      statuses: [],
+      series: [],
+    }
+  );
+  const [statsSummary, setStatsSummary] = useState<DashboardAnalyticsResponse["results"]["stats_summary"]>({
+    total_calls: persistedState?.statsSummary?.total_calls ?? 0,
+    avg_duration: persistedState?.statsSummary?.avg_duration ?? 0,
+    total_duration: persistedState?.statsSummary?.total_duration ?? 0,
+    status_counts: persistedState?.statsSummary?.status_counts ?? [],
   });
-  const [flowBreakdown, setFlowBreakdown] = useState<DashboardResponse["results"]["flow_breakdown"]>([]);
-  const [statusMatrix, setStatusMatrix] = useState<DashboardResponse["results"]["status_matrix"]>({
-    statuses: [],
-    rows: [],
+  const [flowBreakdown, setFlowBreakdown] = useState<DashboardAnalyticsResponse["results"]["flow_breakdown"]>(
+    persistedState?.flowBreakdown ?? []
+  );
+  const [statusMatrix, setStatusMatrix] = useState<DashboardAnalyticsResponse["results"]["status_matrix"]>({
+    statuses: persistedState?.statusMatrix?.statuses ?? [],
+    rows: persistedState?.statusMatrix?.rows ?? [],
   });
-  const [selectedDialer, setSelectedDialer] = useState("all");
-  const [tableSelectedStatuses, setTableSelectedStatuses] = useState<string[]>([]);
+  const [selectedDialer, setSelectedDialer] = useState(persistedState?.selectedDialer ?? "all");
+  const [tableSelectedStatuses, setTableSelectedStatuses] = useState<string[]>(
+    persistedState?.tableSelectedStatuses ?? []
+  );
   const [audioUrls, setAudioUrls] = useState<Record<string, string>>({});
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [audioErrors, setAudioErrors] = useState<Record<string, string>>({});
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState("10");
-  const [autoRefresh, setAutoRefresh] = useState(false);
-  const [appliedDateRange, setAppliedDateRange] = useState<DateRangeDraft>(() => getTodayRangeDraft());
-  const [draftDateRange, setDraftDateRange] = useState<DateRangeDraft>(() => getTodayRangeDraft());
+  const [currentPage, setCurrentPage] = useState(persistedState?.currentPage ?? 1);
+  const [pageSize, setPageSize] = useState(persistedState?.pageSize ?? "10");
+  const [autoRefresh, setAutoRefresh] = useState(persistedState?.autoRefresh ?? false);
+  const [appliedDateRange, setAppliedDateRange] = useState<DateRangeDraft>(
+    persistedState?.appliedDateRange ?? getTodayRangeDraft()
+  );
+  const [draftDateRange, setDraftDateRange] = useState<DateRangeDraft>(
+    persistedState?.draftDateRange ?? getTodayRangeDraft()
+  );
   const [isExportDialogOpen, setIsExportDialogOpen] = useState(false);
   const [selectedExportStatuses, setSelectedExportStatuses] = useState<string[]>([]);
   const [isExporting, setIsExporting] = useState(false);
@@ -595,6 +538,8 @@ export default function Dashboard() {
   const scrollToLogsOnFilterRef = useRef(false);
   const stickyControlsRef = useRef<HTMLDivElement | null>(null);
   const [controlsJoined, setControlsJoined] = useState(false);
+  const isLoading = isTableLoading || isAnalyticsLoading;
+  const isRefreshing = isTableRefreshing || isAnalyticsRefreshing;
 
   const dateLabel = useMemo(
     () =>
@@ -607,61 +552,78 @@ export default function Dashboard() {
 
   const latestRecord = records[0];
 
+  const buildDashboardParams = ({
+    includeTableStatuses = false,
+    statuses = tableSelectedStatuses,
+    page = currentPage,
+    size = pageSize,
+    includePagination = false,
+  }: {
+    includeTableStatuses?: boolean;
+    statuses?: string[];
+    page?: number;
+    size?: string;
+    includePagination?: boolean;
+  } = {}) => {
+    const params = new URLSearchParams();
+    if (selectedDialer !== "all") {
+      params.set("dialer_id", selectedDialer);
+    }
+    if (includeTableStatuses) {
+      for (const status of statuses) {
+        params.append("table_status", status);
+      }
+    }
+    if (includePagination) {
+      params.set("page", String(page));
+      params.set("page_size", size);
+    }
+    if (appliedDateRange.from) {
+      params.set("date_from", toIsoOrNull(appliedDateRange.from) ?? "");
+    }
+    if (appliedDateRange.to) {
+      params.set("date_to", toIsoOrNull(appliedDateRange.to) ?? "");
+    }
+    return params;
+  };
+
   useEffect(() => {
     let active = true;
     let refreshTimer: number | null = null;
 
-    async function loadDashboardFilters({ silent = false } = {}) {
-      if (silent || hasLoadedOnceRef.current) {
-        setIsRefreshing(true);
+    async function loadDashboardTable({ silent = false } = {}) {
+      if (silent || hasLoadedTableRef.current) {
+        setIsTableRefreshing(true);
       } else {
-        setIsLoading(true);
+        setIsTableLoading(true);
       }
       setError(null);
 
       try {
-        const params = new URLSearchParams();
-        if (selectedDialer !== "all") {
-          params.set("dialer_id", selectedDialer);
-        }
-        for (const status of tableSelectedStatuses) {
-          params.append("table_status", status);
-        }
-        params.set("page", String(currentPage));
-        params.set("page_size", pageSize);
-        if (appliedDateRange.from) {
-          params.set("date_from", toIsoOrNull(appliedDateRange.from) ?? "");
-        }
-        if (appliedDateRange.to) {
-          params.set("date_to", toIsoOrNull(appliedDateRange.to) ?? "");
-        }
-
-        const query = params.toString();
+        const query = buildDashboardParams({
+          includeTableStatuses: true,
+          includePagination: true,
+        }).toString();
         const res = await fetch(
           `/api/dashboard/filters/${query ? `?${query}` : ""}`,
           {
             credentials: "include",
           }
         );
-        const data: DashboardResponse & { error?: string } = await res.json();
+        const data: DashboardTableResponse & { error?: string } = await res.json();
 
         if (!active) {
           return;
         }
 
         if (!res.ok) {
-          throw new Error(data.error || "Failed to load dashboard filters.");
+          throw new Error(data.error || "Failed to load dashboard table.");
         }
 
         setDialers(data.dialers);
         setRecords(data.results.records);
         setPagination(data.results.pagination);
-        setTotalCount(data.results.total_count);
-        setChartRecords(data.results.chart_records);
-        setStatsSummary(data.results.stats_summary);
-        setStatusMatrix(data.results.status_matrix);
-        setFlowBreakdown(data.results.flow_breakdown);
-        hasLoadedOnceRef.current = true;
+        hasLoadedTableRef.current = true;
       } catch (fetchError) {
         if (!active) {
           return;
@@ -670,21 +632,21 @@ export default function Dashboard() {
         setError(
           fetchError instanceof Error
             ? fetchError.message
-            : "Failed to load dashboard filters."
+            : "Failed to load dashboard table."
         );
       } finally {
         if (active) {
-          setIsLoading(false);
-          setIsRefreshing(false);
+          setIsTableLoading(false);
+          setIsTableRefreshing(false);
         }
       }
     }
 
-    loadDashboardFilters();
+    loadDashboardTable();
 
     if (autoRefresh) {
       refreshTimer = window.setInterval(() => {
-        void loadDashboardFilters({ silent: true });
+        void loadDashboardTable({ silent: true });
       }, 5000);
     }
 
@@ -697,8 +659,123 @@ export default function Dashboard() {
   }, [selectedDialer, appliedDateRange, autoRefresh, currentPage, pageSize, tableSelectedStatuses]);
 
   useEffect(() => {
+    let active = true;
+    let refreshTimer: number | null = null;
+
+    async function loadDashboardAnalytics({ silent = false } = {}) {
+      if (silent || hasLoadedAnalyticsRef.current) {
+        setIsAnalyticsRefreshing(true);
+      } else {
+        setIsAnalyticsLoading(true);
+      }
+      setError(null);
+
+      try {
+        const query = buildDashboardParams().toString();
+        const res = await fetch(
+          `/api/dashboard/analytics/${query ? `?${query}` : ""}`,
+          {
+            credentials: "include",
+          }
+        );
+        const data: DashboardAnalyticsResponse & { error?: string } = await res.json();
+
+        if (!active) {
+          return;
+        }
+
+        if (!res.ok) {
+          throw new Error(data.error || "Failed to load dashboard analytics.");
+        }
+
+        setTotalCount(data.results.total_count);
+        setStatusChart(data.results.status_chart);
+        setStatsSummary(data.results.stats_summary);
+        setStatusMatrix(data.results.status_matrix);
+        setFlowBreakdown(data.results.flow_breakdown);
+        hasLoadedAnalyticsRef.current = true;
+      } catch (fetchError) {
+        if (!active) {
+          return;
+        }
+
+        setError(
+          fetchError instanceof Error
+            ? fetchError.message
+            : "Failed to load dashboard analytics."
+        );
+      } finally {
+        if (active) {
+          setIsAnalyticsLoading(false);
+          setIsAnalyticsRefreshing(false);
+        }
+      }
+    }
+
+    loadDashboardAnalytics();
+
+    if (autoRefresh) {
+      refreshTimer = window.setInterval(() => {
+        void loadDashboardAnalytics({ silent: true });
+      }, 20000);
+    }
+
+    return () => {
+      active = false;
+      if (refreshTimer) {
+        window.clearInterval(refreshTimer);
+      }
+    };
+  }, [selectedDialer, appliedDateRange, autoRefresh]);
+
+  useEffect(() => {
     setCurrentPage(1);
   }, [selectedDialer, appliedDateRange, pageSize, tableSelectedStatuses]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const nextState: DashboardPersistedState = {
+      dialers,
+      records,
+      pagination,
+      totalCount,
+      statusChart,
+      statsSummary,
+      flowBreakdown,
+      statusMatrix,
+      selectedDialer,
+      tableSelectedStatuses,
+      currentPage,
+      pageSize,
+      autoRefresh,
+      appliedDateRange,
+      draftDateRange,
+    };
+
+    window.sessionStorage.setItem(
+      DASHBOARD_STORAGE_KEY,
+      JSON.stringify(nextState)
+    );
+  }, [
+    dialers,
+    records,
+    pagination,
+    totalCount,
+    statusChart,
+    statsSummary,
+    flowBreakdown,
+    statusMatrix,
+    selectedDialer,
+    tableSelectedStatuses,
+    currentPage,
+    pageSize,
+    autoRefresh,
+    appliedDateRange,
+    draftDateRange,
+  ]);
 
   const selectedDialerLabel =
     selectedDialer === "all"
@@ -714,7 +791,6 @@ const recordsRangeEnd =
   pagination.total_records === 0
     ? 0
     : Math.min(pagination.page * pagination.page_size, pagination.total_records);
-  const statusChart = useMemo(() => buildStatusChart(chartRecords), [chartRecords]);
 
   const chartConfig = useMemo<ChartConfig>(() => {
     return statusChart.statuses.reduce<ChartConfig>((config, status, index) => {
@@ -795,7 +871,7 @@ const recordsRangeEnd =
       const res = await fetch(`/api/dashboard/filters/?${params.toString()}`, {
         credentials: "include",
       });
-      const data: DashboardResponse & { error?: string } = await res.json();
+      const data: DashboardTableResponse & { error?: string } = await res.json();
 
       if (!res.ok) {
         throw new Error(data.error || "Failed to export call logs.");
@@ -1201,7 +1277,7 @@ const recordsRangeEnd =
                     content={
                       <ChartTooltipContent
                         indicator="line"
-                        labelFormatter={(label) => `${statusChart.bucketLabel}: ${label}`}
+                        labelFormatter={(label) => `${statusChart.bucket_label}: ${label}`}
                         formatter={(value, name, item) => {
                           const numericValue = Number(value ?? 0);
                           const percentage =
