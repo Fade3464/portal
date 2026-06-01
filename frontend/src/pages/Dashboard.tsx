@@ -207,6 +207,7 @@ type DashboardPersistedState = {
 };
 
 const DASHBOARD_STORAGE_KEY = "dashboard-page-state-v1";
+const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 5000;
 
 function readDashboardPersistedState(): DashboardPersistedState | null {
   if (typeof window === "undefined") {
@@ -647,7 +648,7 @@ export default function Dashboard() {
     if (autoRefresh) {
       refreshTimer = window.setInterval(() => {
         void loadDashboardTable({ silent: true });
-      }, 5000);
+      }, DASHBOARD_AUTO_REFRESH_INTERVAL_MS);
     }
 
     return () => {
@@ -717,7 +718,7 @@ export default function Dashboard() {
     if (autoRefresh) {
       refreshTimer = window.setInterval(() => {
         void loadDashboardAnalytics({ silent: true });
-      }, 20000);
+      }, DASHBOARD_AUTO_REFRESH_INTERVAL_MS);
     }
 
     return () => {

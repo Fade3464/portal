@@ -109,6 +109,58 @@ class CallLog(models.Model):
         return str(self.call_id)
 
 
+class CallLogMinuteRollup(models.Model):
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="call_log_minute_rollups",
+    )
+    dialer = models.ForeignKey(
+        Dialer,
+        on_delete=models.CASCADE,
+        related_name="call_log_minute_rollups",
+    )
+    bucket_start = models.DateTimeField()
+    status = models.CharField(max_length=255, db_index=True)
+    flow = models.CharField(max_length=255, blank=True, default="")
+    batch = models.IntegerField(default=0)
+    call_count = models.PositiveIntegerField(default=0)
+    total_duration = models.BigIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-bucket_start", "dialer_id", "status", "flow", "batch"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "dialer", "bucket_start", "status", "flow", "batch"],
+                name="cl_minute_rollup_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "bucket_start"],
+                name="clmr_client_bucket_idx",
+            ),
+            models.Index(
+                fields=["client", "dialer", "bucket_start"],
+                name="clmr_client_dialer_bucket_idx",
+            ),
+            models.Index(
+                fields=["client", "status", "bucket_start"],
+                name="clmr_client_status_bucket_idx",
+            ),
+            models.Index(
+                fields=["client", "flow", "batch", "bucket_start"],
+                name="clmr_cli_flow_batch_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.client_id}:{self.dialer_id}:{self.bucket_start.isoformat()}:"
+            f"{self.status}:{self.flow}:{self.batch}"
+        )
+
+
 class BlacklistedNumbers(models.Model):
     number = models.BigIntegerField(
         unique=True,

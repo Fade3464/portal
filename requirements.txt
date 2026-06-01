@@ -12,6 +12,7 @@ lxml==6.0.2
 MarkupSafe==3.0.3
 proxmoxer==2.2.0
 psycopg2-binary==2.9.11
+redis==5.2.1
 python-docx==1.2.0
 python-http-client==3.3.7
 sendgrid==3.6.5

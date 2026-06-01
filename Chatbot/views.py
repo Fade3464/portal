@@ -7,8 +7,8 @@ import json
 import os
 import random
 import struct
-from threading import Lock
 import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
@@ -21,7 +21,7 @@ from django.core.exceptions import ValidationError
 from django.core import signing
 from django.core.validators import URLValidator, validate_email
 from django.db import transaction
-from django.db.models import Avg, Count, Sum
+from django.db.models import Count, Sum
 from django.db.models.functions import TruncDay, TruncHour, TruncMinute, TruncMonth
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
@@ -30,9 +30,22 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
-from .models import BlacklistedNumbers, CallLog, Dialer, LoginRateLimit, RESTAPITOKENS
+from .models import (
+    BlacklistedNumbers,
+    CallLog,
+    CallLogMinuteRollup,
+    Dialer,
+    LoginRateLimit,
+    RESTAPITOKENS,
+)
 from .api_token_cache import get_active_api_tokens, preload_active_api_tokens
+from .dashboard_cache import build_dashboard_cache_key, bump_dashboard_cache_version
 from .route_cache import get_dialer_route_map, preload_dialer_route_map
+from .rollups import (
+    adjust_call_log_rollup,
+    build_call_log_rollup_snapshot,
+    increment_call_log_rollup,
+)
 
 AREA_CODES_CSV_PATH = Path("/home/kali/new1.2/assets/us_area_codes.csv")
 url_validator = URLValidator()
@@ -40,13 +53,9 @@ PASSWORD_RESET_SALT = "chatbot-forgot-password-v1"
 TOTP_ISSUER = "Portal"
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_LOCKOUT_SECONDS = 3600
-LIVE_STATUS_TIMEOUT_SECONDS = 200
-LIVE_STATUS_EXPIRED_VALUE = "DROP"
-LIVE_STATUS_ACTIVE_VALUE = "LIVE"
-_live_status_expiry_lock = Lock()
-_last_live_status_expiry_check = 0.0
-DASHBOARD_TABLE_CACHE_TTL_SECONDS = 5
-DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 20
+DASHBOARD_TABLE_CACHE_TTL_SECONDS = 30
+DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 120
+LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 5
 
 
 def _get_user_display_name(user):
@@ -190,26 +199,6 @@ def _clear_failed_login_attempts(ip_address):
         last_failed_at=None,
         locked_until=None,
     )
-
-
-def _expire_stale_live_call_logs():
-    global _last_live_status_expiry_check
-
-    now_monotonic = time.monotonic()
-    if now_monotonic - _last_live_status_expiry_check < 30:
-        return
-
-    with _live_status_expiry_lock:
-        now_monotonic = time.monotonic()
-        if now_monotonic - _last_live_status_expiry_check < 30:
-            return
-
-        expiry_cutoff = timezone.now() - timedelta(seconds=LIVE_STATUS_TIMEOUT_SECONDS)
-        CallLog.objects.filter(
-            status__iexact=LIVE_STATUS_ACTIVE_VALUE,
-            created_at__lte=expiry_cutoff,
-        ).update(status=LIVE_STATUS_EXPIRED_VALUE)
-        _last_live_status_expiry_check = now_monotonic
 
 
 def _extract_api_token(request):
@@ -489,13 +478,6 @@ def _get_today_range():
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     return start_of_day, end_of_day
-
-
-def _build_dashboard_cache_key(namespace, cache_payload):
-    digest = hashlib.sha256(
-        json.dumps(cache_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"{namespace}:{digest}"
 
 
 def _serialize_account_profile(client):
@@ -971,7 +953,6 @@ def forgot_password_reset_view(request):
 
 @require_GET
 def preload_dialer_routes_view(request):
-    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -997,7 +978,6 @@ def preload_dialer_routes_view(request):
 @csrf_exempt
 @require_POST
 def request_route_view(request):
-    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1046,7 +1026,6 @@ def request_route_view(request):
 @csrf_exempt
 @require_POST
 def check_batchnflow_view(request):
-    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1084,7 +1063,6 @@ def check_batchnflow_view(request):
 @csrf_exempt
 @require_POST
 def create_call_log_view(request):
-    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1105,8 +1083,16 @@ def create_call_log_view(request):
         if resolved_state is None:
             resolved_state = _derive_state_from_call_id(resolved_call_id)
         call_log_assignment = _get_call_log_flow_and_batch(dialer.id)
+        recording_link = normalized_fields.get("call_recording_link")
+        if not recording_link:
+            generated_call_uuid = uuid.uuid4()
+            generated_recording_link = _build_call_recording_link(generated_call_uuid)
+        else:
+            generated_call_uuid = None
+            generated_recording_link = None
 
         call_log = CallLog.objects.create(
+            **({"call_uuid": generated_call_uuid} if generated_call_uuid else {}),
             call_id=resolved_call_id,
             dialer=dialer,
             status=normalized_fields["status"],
@@ -1114,16 +1100,13 @@ def create_call_log_view(request):
             flow=call_log_assignment["flow"],
             batch=call_log_assignment["batch"],
             duration=normalized_fields["duration"],
-            call_recording_link=normalized_fields.get("call_recording_link"),
+            call_recording_link=recording_link or generated_recording_link,
         )
-
-        if not call_log.call_recording_link:
-            generated_recording_link = _build_call_recording_link(call_log.call_uuid)
-            if generated_recording_link:
-                call_log.call_recording_link = generated_recording_link
-                call_log.save(update_fields=["call_recording_link"])
     except ValueError as exc:
         return _json_error(str(exc), status=400)
+
+    increment_call_log_rollup(call_log)
+    bump_dashboard_cache_version(dialer.client_id)
 
     return _json_response(
         {
@@ -1133,11 +1116,12 @@ def create_call_log_view(request):
         status=201,
     )
 
-
+from time import perf_counter
 @csrf_exempt
 @require_http_methods(["PATCH", "POST"])
 def update_call_log_view(request, call_uuid):
-    _expire_stale_live_call_logs()
+    update_started_at = perf_counter()
+
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1154,6 +1138,9 @@ def update_call_log_view(request, call_uuid):
     )
     if call_log is None:
         return _json_error("No call log found for the provided call_uuid.", status=404)
+
+    previous_rollup_snapshot = build_call_log_rollup_snapshot(call_log)
+    original_client_id = call_log.dialer.client_id
 
     try:
         normalized_fields = _validate_call_log_payload(payload, require_status=False)
@@ -1208,17 +1195,28 @@ def update_call_log_view(request, call_uuid):
     if update_fields:
         call_log.save(update_fields=update_fields)
 
+        current_rollup_snapshot = build_call_log_rollup_snapshot(call_log)
+        adjust_call_log_rollup(previous_rollup_snapshot, current_rollup_snapshot)
+
+    updated_client_id = call_log.dialer.client_id
+
+    bump_dashboard_cache_version(original_client_id)
+    if updated_client_id != original_client_id:
+        bump_dashboard_cache_version(updated_client_id)
+
+    update_time_seconds = perf_counter() - update_started_at
+
     return _json_response(
         {
             "message": "Call log updated successfully.",
+            "update_time_seconds": round(update_time_seconds, 6),
+            "update_time_ms": round(update_time_seconds * 1000, 2),
             "call_log": _serialize_call_log(call_log),
         }
     )
 
-
 @require_GET
 def check_blacklisted_number_view(request, call_id):
-    _expire_stale_live_call_logs()
     token_error = _require_call_log_api_token(request)
     if token_error:
         return token_error
@@ -1320,7 +1318,39 @@ def _build_dashboard_base_queryset(scope):
     return filtered_logs
 
 
-def _build_dashboard_status_chart(filtered_logs, start_at, end_at):
+def _build_dashboard_rollup_queryset(scope):
+    filtered_rollups = CallLogMinuteRollup.objects.filter(
+        client_id=scope["client"].id,
+        dialer_id__in=scope["active_dialer_ids"],
+    )
+
+    if scope["start_at"]:
+        filtered_rollups = filtered_rollups.filter(bucket_start__gte=scope["start_at"])
+
+    if scope["end_at"]:
+        filtered_rollups = filtered_rollups.filter(bucket_start__lte=scope["end_at"])
+
+    return filtered_rollups
+
+
+def _get_dashboard_analytics_cache_ttl(scope):
+    now = timezone.now()
+    start_at = scope["start_at"]
+    end_at = scope["end_at"]
+
+    if start_at is None or end_at is None:
+        return LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS
+
+    if start_at <= now <= end_at:
+        return LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS
+
+    if end_at >= now - timedelta(minutes=5):
+        return LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS
+
+    return DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS
+
+
+def _build_dashboard_status_chart(filtered_rollups, start_at, end_at):
     if start_at and end_at:
         span = end_at - start_at
     else:
@@ -1344,9 +1374,9 @@ def _build_dashboard_status_chart(filtered_logs, start_at, end_at):
         label_format = "%b %Y"
 
     chart_rows = list(
-        filtered_logs.annotate(bucket=bucket_trunc("created_at"))
+        filtered_rollups.annotate(bucket=bucket_trunc("bucket_start"))
         .values("bucket", "status")
-        .annotate(count=Count("id"))
+        .annotate(count=Sum("call_count"))
         .order_by("bucket", "status")
     )
 
@@ -1396,6 +1426,83 @@ def _build_dashboard_status_chart(filtered_logs, start_at, end_at):
     }
 
 
+def _build_dashboard_status_chart_from_logs(filtered_logs, start_at, end_at):
+    if start_at and end_at:
+        span = end_at - start_at
+    else:
+        span = timedelta(days=1)
+
+    if span <= timedelta(hours=6):
+        bucket_trunc = TruncMinute
+        bucket_label = "Time"
+        label_format = "%I:%M %p"
+    elif span <= timedelta(days=3):
+        bucket_trunc = TruncHour
+        bucket_label = "Time"
+        label_format = "%b %d, %I:%M %p"
+    elif span <= timedelta(days=120):
+        bucket_trunc = TruncDay
+        bucket_label = "Date"
+        label_format = "%b %d"
+    else:
+        bucket_trunc = TruncMonth
+        bucket_label = "Period"
+        label_format = "%b %Y"
+
+    chart_rows = list(
+        filtered_logs.annotate(bucket=bucket_trunc("created_at"))
+        .values("bucket", "status")
+        .annotate(count=Count("id"))
+        .order_by("bucket", "status")
+    )
+
+    if not chart_rows:
+        return {
+            "bucket_label": bucket_label,
+            "statuses": [],
+            "series": [],
+        }
+
+    status_totals = {}
+    bucket_lookup = {}
+
+    for row in chart_rows:
+        bucket = row["bucket"]
+        status = row["status"] or "unknown"
+        count = row["count"] or 0
+
+        status_totals[status] = status_totals.get(status, 0) + count
+
+        if bucket not in bucket_lookup:
+            local_bucket = timezone.localtime(bucket)
+            bucket_lookup[bucket] = {
+                "bucket": local_bucket.isoformat(),
+                "label": local_bucket.strftime(label_format),
+            }
+
+        bucket_lookup[bucket][status] = count
+
+    statuses = [
+        status
+        for status, _ in sorted(
+            status_totals.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+    series = []
+    for bucket in sorted(bucket_lookup.keys()):
+        row = bucket_lookup[bucket]
+        for status in statuses:
+            row.setdefault(status, 0)
+        series.append(row)
+
+    return {
+        "bucket_label": bucket_label,
+        "statuses": statuses,
+        "series": series,
+    }
+
 @require_GET
 def dashboard_filters_view(request):
     scope, error_response = _get_dashboard_scope(request)
@@ -1422,10 +1529,10 @@ def dashboard_filters_view(request):
     if page_size_number < 1 or page_size_number > 100:
         return _json_error("page_size must be between 1 and 100.", status=400)
 
-    dashboard_cache_key = _build_dashboard_cache_key(
+    dashboard_cache_key = build_dashboard_cache_key(
         "dashboard_table",
+        scope["client"].id,
         {
-            "client_id": scope["client"].id,
             "dialer_id": scope["normalized_dialer_id"],
             "table_statuses": sorted(table_selected_statuses),
             "date_from": scope["start_at"].isoformat() if scope["start_at"] else None,
@@ -1518,10 +1625,12 @@ def dashboard_analytics_view(request):
     if error_response:
         return error_response
 
-    dashboard_cache_key = _build_dashboard_cache_key(
+    analytics_cache_ttl = _get_dashboard_analytics_cache_ttl(scope)
+
+    dashboard_cache_key = build_dashboard_cache_key(
         "dashboard_analytics",
+        scope["client"].id,
         {
-            "client_id": scope["client"].id,
             "dialer_id": scope["normalized_dialer_id"],
             "date_from": scope["start_at"].isoformat() if scope["start_at"] else None,
             "date_to": scope["end_at"].isoformat() if scope["end_at"] else None,
@@ -1557,26 +1666,42 @@ def dashboard_analytics_view(request):
         cache.set(
             dashboard_cache_key,
             response_payload,
-            DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS,
+            analytics_cache_ttl,
         )
         return _json_response(response_payload)
 
     filtered_logs = _build_dashboard_base_queryset(scope)
+
     overall_summary = filtered_logs.aggregate(
         total_count=Count("id"),
-        avg_duration=Avg("duration"),
         total_duration=Sum("duration"),
     )
-    total_count = overall_summary["total_count"] or 0
+
+    total_count = int(overall_summary["total_count"] or 0)
+    total_duration = int(overall_summary["total_duration"] or 0)
+    avg_duration = (total_duration / total_count) if total_count else 0
+
     status_summary_rows = list(
         filtered_logs.values("status").annotate(count=Count("id"))
     )
+
     status_matrix_rows = list(
         filtered_logs.values("dialer_id", "status").annotate(count=Count("id"))
     )
+
     breakdown_rows = list(
         filtered_logs.values("dialer_id", "flow", "batch").annotate(count=Count("id"))
     )
+
+    status_summary_rows = [
+        row for row in status_summary_rows if row["count"]
+    ]
+    status_matrix_rows = [
+        row for row in status_matrix_rows if row["count"]
+    ]
+    breakdown_rows = [
+        row for row in breakdown_rows if row["count"]
+    ]
 
     status_summary_rows.sort(key=lambda row: (-row["count"], row["status"] or ""))
     status_matrix_rows.sort(
@@ -1689,15 +1814,15 @@ def dashboard_analytics_view(request):
         "filters": _build_dashboard_filters_payload(scope),
         "results": {
             "total_count": total_count,
-            "status_chart": _build_dashboard_status_chart(
+            "status_chart": _build_dashboard_status_chart_from_logs(
                 filtered_logs,
                 scope["start_at"],
                 scope["end_at"],
             ),
             "stats_summary": {
                 "total_calls": total_count,
-                "avg_duration": float(overall_summary["avg_duration"] or 0),
-                "total_duration": int(overall_summary["total_duration"] or 0),
+                "avg_duration": float(avg_duration),
+                "total_duration": total_duration,
                 "status_counts": [
                     {
                         "status": row["status"] or "unknown",
@@ -1717,14 +1842,13 @@ def dashboard_analytics_view(request):
     cache.set(
         dashboard_cache_key,
         response_payload,
-        DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS,
+        analytics_cache_ttl,
     )
     return _json_response(response_payload)
 
 
 @require_GET
 def call_log_search_view(request):
-    _expire_stale_live_call_logs()
     client, error_response = _get_authenticated_client(request)
     if error_response:
         return error_response

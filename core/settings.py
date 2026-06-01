@@ -100,11 +100,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = os.getenv("DB_PORT", "")
 DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "60"))
-CACHE_BACKEND = os.getenv(
-    "CACHE_BACKEND",
-    "django.core.cache.backends.filebased.FileBasedCache",
-)
+CACHE_TIMEOUT = int(os.getenv("CACHE_TIMEOUT", "300"))
+CACHE_KEY_PREFIX = os.getenv("CACHE_KEY_PREFIX", "aims")
+CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "5000"))
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
 CACHE_LOCATION = os.getenv("CACHE_LOCATION", str(BASE_DIR / ".django_cache"))
+
+if PROD and not REDIS_URL:
+    raise ImproperlyConfigured("REDIS_URL must be configured in production.")
 
 DATABASES = {
     'default': {
@@ -118,16 +121,32 @@ DATABASES = {
     }
 }
 
-CACHES = {
-    "default": {
-        "BACKEND": CACHE_BACKEND,
-        "LOCATION": CACHE_LOCATION,
-        "TIMEOUT": int(os.getenv("CACHE_TIMEOUT", "300")),
-        "OPTIONS": {
-            "MAX_ENTRIES": int(os.getenv("CACHE_MAX_ENTRIES", "5000")),
-        },
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "TIMEOUT": CACHE_TIMEOUT,
+            "KEY_PREFIX": CACHE_KEY_PREFIX,
+            "OPTIONS": {
+                "socket_connect_timeout": float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "2")),
+                "socket_timeout": float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")),
+                "retry_on_timeout": _get_bool_env("REDIS_RETRY_ON_TIMEOUT", True),
+            },
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+            "LOCATION": CACHE_LOCATION,
+            "TIMEOUT": CACHE_TIMEOUT,
+            "KEY_PREFIX": CACHE_KEY_PREFIX,
+            "OPTIONS": {
+                "MAX_ENTRIES": CACHE_MAX_ENTRIES,
+            },
+        }
+    }
 
 
 # Password validation
