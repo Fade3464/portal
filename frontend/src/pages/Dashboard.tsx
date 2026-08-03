@@ -1,4 +1,3 @@
-import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarDays,
   ChevronDown,
@@ -10,6 +9,7 @@ import {
   Play,
   X,
 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CartesianGrid,
   Cell,
@@ -22,7 +22,6 @@ import {
 } from "recharts";
 
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   ChartContainer,
@@ -32,6 +31,7 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Collapsible,
   CollapsibleContent,
@@ -100,6 +100,12 @@ type CallLogRecord = {
   created_at: string;
 };
 
+type PlayableRecording = {
+  call_uuid: string;
+  call_id: number;
+  call_recording_link: string | null;
+};
+
 type DashboardFilters = {
   dialer_id: number | null;
   dialer_name: string;
@@ -162,6 +168,20 @@ type DashboardAnalyticsResponse = {
         >;
       }>;
     };
+    playback_batch_performance: Array<{
+      dialer_id: number;
+      dialer_name: string;
+      total_count: number;
+      flows: Array<{
+        flow: string;
+        total_count: number;
+        batches: Array<{
+          batch: number;
+          count: number;
+          sample_recording: PlayableRecording | null;
+        }>;
+      }>;
+    }>;
     flow_breakdown: Array<{
       dialer_id: number;
       dialer_name: string;
@@ -183,6 +203,8 @@ type DateRangeDraft = {
   to: string;
 };
 
+type QuickRangeMinutes = 5 | 10 | 30 | 60 | 180;
+
 type DashboardPersistedState = {
   dialers: DialerOption[];
   records: CallLogRecord[];
@@ -195,6 +217,7 @@ type DashboardPersistedState = {
   totalCount: number;
   statusChart: BuiltStatusChart;
   statsSummary: DashboardAnalyticsResponse["results"]["stats_summary"];
+  playbackBatchPerformance: DashboardAnalyticsResponse["results"]["playback_batch_performance"];
   flowBreakdown: DashboardAnalyticsResponse["results"]["flow_breakdown"];
   statusMatrix: DashboardAnalyticsResponse["results"]["status_matrix"];
   selectedDialer: string;
@@ -202,28 +225,21 @@ type DashboardPersistedState = {
   currentPage: number;
   pageSize: string;
   autoRefresh: boolean;
+  activeQuickRangeMinutes: QuickRangeMinutes | null;
   appliedDateRange: DateRangeDraft;
   draftDateRange: DateRangeDraft;
 };
 
-const DASHBOARD_STORAGE_KEY = "dashboard-page-state-v1";
 const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 5000;
+const QUICK_RANGE_OPTIONS: QuickRangeMinutes[] = [5, 10, 30, 60, 180];
+let dashboardPersistedStateMemory: DashboardPersistedState | null = null;
+
+export function clearDashboardPersistedState() {
+  dashboardPersistedStateMemory = null;
+}
 
 function readDashboardPersistedState(): DashboardPersistedState | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  try {
-    const rawValue = window.sessionStorage.getItem(DASHBOARD_STORAGE_KEY);
-    if (!rawValue) {
-      return null;
-    }
-
-    return JSON.parse(rawValue) as DashboardPersistedState;
-  } catch {
-    return null;
-  }
+  return dashboardPersistedStateMemory;
 }
 
 const DASHBOARD_TIMEZONE = "America/New_York";
@@ -337,6 +353,34 @@ function getTodayRangeDraft(): DateRangeDraft {
   };
 }
 
+function formatDateTimeInputValue(date: Date) {
+  const parts = getTimeZoneParts(date, DASHBOARD_TIMEZONE);
+  const pad = (value: number) => `${value}`.padStart(2, "0");
+
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`;
+}
+
+function getQuickRangeDraft(minutes: QuickRangeMinutes): DateRangeDraft {
+  const now = new Date();
+
+  return {
+    from: formatDateTimeInputValue(new Date(now.getTime() - minutes * 60_000)),
+    to: formatDateTimeInputValue(now),
+  };
+}
+
+function formatQuickRangeLabel(minutes: QuickRangeMinutes) {
+  if (minutes === 60) {
+    return "Last 1 hour";
+  }
+
+  if (minutes === 180) {
+    return "Last 3 hours";
+  }
+
+  return `Last ${minutes} minutes`;
+}
+
 
 const BASE_STATUS_COLORS = [
   "#0f766e",
@@ -382,19 +426,6 @@ function getStatusColor(statusOrIndex: string | number, index?: number) {
   return `hsl(${hue} ${saturation}% ${lightness}%)`;
 }
 
-function getStatusTextColor(status: string, index: number) {
-  const fixedColor = FIXED_STATUS_COLORS[status.trim().toLowerCase()];
-  if (fixedColor) {
-    return "#f8fafc";
-  }
-
-  if (index < BASE_STATUS_COLORS.length) {
-    const darkTextIndexes = new Set([1, 4, 7, 10]);
-    return darkTextIndexes.has(index % 12) ? "#1f2937" : "#f8fafc";
-  }
-  return "#f8fafc";
-}
-
 function prettifyStatusLabel(status: string) {
   if (!status) {
     return "Unknown";
@@ -419,16 +450,17 @@ function formatDurationValue(seconds: number) {
 
 function getStatusCardStyle(color: string) {
   return {
-    background: `linear-gradient(180deg, color-mix(in srgb, ${color} 92%, white 8%) 0%, color-mix(in srgb, ${color} 84%, black 16%) 100%)`,
-    borderColor: `color-mix(in srgb, ${color} 72%, transparent)`,
-    boxShadow: `inset 0 1px 0 color-mix(in srgb, ${color} 40%, white 60%), 0 10px 26px -18px ${color}`,
+    background: `linear-gradient(135deg, color-mix(in srgb, ${color} 10%, var(--background)) 0%, var(--background) 72%)`,
+    borderColor: `color-mix(in srgb, ${color} 28%, var(--border))`,
+    borderLeftColor: color,
+    boxShadow: "0 1px 2px color-mix(in srgb, var(--foreground) 5%, transparent)",
   };
 }
 
 function getLiveStatusCardStyle(color: string) {
   return {
     ...getStatusCardStyle(color),
-    boxShadow: `inset 0 1px 0 color-mix(in srgb, ${color} 44%, white 56%), 0 14px 30px -18px ${color}, 0 0 0 1px color-mix(in srgb, ${color} 30%, transparent)`,
+    boxShadow: `0 0 0 1px color-mix(in srgb, ${color} 16%, transparent), 0 8px 24px -20px ${color}`,
   };
 }
 
@@ -507,6 +539,9 @@ export default function Dashboard() {
     total_duration: persistedState?.statsSummary?.total_duration ?? 0,
     status_counts: persistedState?.statsSummary?.status_counts ?? [],
   });
+  const [playbackBatchPerformance, setPlaybackBatchPerformance] = useState<
+    DashboardAnalyticsResponse["results"]["playback_batch_performance"]
+  >(persistedState?.playbackBatchPerformance ?? []);
   const [flowBreakdown, setFlowBreakdown] = useState<DashboardAnalyticsResponse["results"]["flow_breakdown"]>(
     persistedState?.flowBreakdown ?? []
   );
@@ -523,7 +558,11 @@ export default function Dashboard() {
   const [audioErrors, setAudioErrors] = useState<Record<string, string>>({});
   const [currentPage, setCurrentPage] = useState(persistedState?.currentPage ?? 1);
   const [pageSize, setPageSize] = useState(persistedState?.pageSize ?? "10");
-  const [autoRefresh, setAutoRefresh] = useState(persistedState?.autoRefresh ?? false);
+  const [autoRefresh, setAutoRefresh] = useState(persistedState?.autoRefresh ?? true);
+  const [activeQuickRangeMinutes, setActiveQuickRangeMinutes] =
+    useState<QuickRangeMinutes | null>(
+      persistedState?.activeQuickRangeMinutes ?? null
+    );
   const [appliedDateRange, setAppliedDateRange] = useState<DateRangeDraft>(
     persistedState?.appliedDateRange ?? getTodayRangeDraft()
   );
@@ -542,16 +581,16 @@ export default function Dashboard() {
   const isLoading = isTableLoading || isAnalyticsLoading;
   const isRefreshing = isTableRefreshing || isAnalyticsRefreshing;
 
-  const dateLabel = useMemo(
-    () =>
-      formatDateRangeLabel(
-        toIsoOrNull(appliedDateRange.from),
-        toIsoOrNull(appliedDateRange.to)
-      ),
-    [appliedDateRange]
-  );
+  const dateLabel = useMemo(() => {
+    if (activeQuickRangeMinutes !== null) {
+      return formatQuickRangeLabel(activeQuickRangeMinutes);
+    }
 
-  const latestRecord = records[0];
+    return formatDateRangeLabel(
+      toIsoOrNull(appliedDateRange.from),
+      toIsoOrNull(appliedDateRange.to)
+    );
+  }, [activeQuickRangeMinutes, appliedDateRange]);
 
   const buildDashboardParams = ({
     includeTableStatuses = false,
@@ -567,6 +606,11 @@ export default function Dashboard() {
     includePagination?: boolean;
   } = {}) => {
     const params = new URLSearchParams();
+    const effectiveDateRange =
+      activeQuickRangeMinutes === null
+        ? appliedDateRange
+        : getQuickRangeDraft(activeQuickRangeMinutes);
+
     if (selectedDialer !== "all") {
       params.set("dialer_id", selectedDialer);
     }
@@ -579,11 +623,11 @@ export default function Dashboard() {
       params.set("page", String(page));
       params.set("page_size", size);
     }
-    if (appliedDateRange.from) {
-      params.set("date_from", toIsoOrNull(appliedDateRange.from) ?? "");
+    if (effectiveDateRange.from) {
+      params.set("date_from", toIsoOrNull(effectiveDateRange.from) ?? "");
     }
-    if (appliedDateRange.to) {
-      params.set("date_to", toIsoOrNull(appliedDateRange.to) ?? "");
+    if (effectiveDateRange.to) {
+      params.set("date_to", toIsoOrNull(effectiveDateRange.to) ?? "");
     }
     return params;
   };
@@ -657,7 +701,7 @@ export default function Dashboard() {
         window.clearInterval(refreshTimer);
       }
     };
-  }, [selectedDialer, appliedDateRange, autoRefresh, currentPage, pageSize, tableSelectedStatuses]);
+  }, [selectedDialer, appliedDateRange, activeQuickRangeMinutes, autoRefresh, currentPage, pageSize, tableSelectedStatuses]);
 
   useEffect(() => {
     let active = true;
@@ -692,6 +736,7 @@ export default function Dashboard() {
         setTotalCount(data.results.total_count);
         setStatusChart(data.results.status_chart);
         setStatsSummary(data.results.stats_summary);
+        setPlaybackBatchPerformance(data.results.playback_batch_performance);
         setStatusMatrix(data.results.status_matrix);
         setFlowBreakdown(data.results.flow_breakdown);
         hasLoadedAnalyticsRef.current = true;
@@ -727,17 +772,13 @@ export default function Dashboard() {
         window.clearInterval(refreshTimer);
       }
     };
-  }, [selectedDialer, appliedDateRange, autoRefresh]);
+  }, [selectedDialer, appliedDateRange, activeQuickRangeMinutes, autoRefresh]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedDialer, appliedDateRange, pageSize, tableSelectedStatuses]);
+  }, [selectedDialer, appliedDateRange, activeQuickRangeMinutes, pageSize, tableSelectedStatuses]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
     const nextState: DashboardPersistedState = {
       dialers,
       records,
@@ -745,6 +786,7 @@ export default function Dashboard() {
       totalCount,
       statusChart,
       statsSummary,
+      playbackBatchPerformance,
       flowBreakdown,
       statusMatrix,
       selectedDialer,
@@ -752,14 +794,12 @@ export default function Dashboard() {
       currentPage,
       pageSize,
       autoRefresh,
+      activeQuickRangeMinutes,
       appliedDateRange,
       draftDateRange,
     };
 
-    window.sessionStorage.setItem(
-      DASHBOARD_STORAGE_KEY,
-      JSON.stringify(nextState)
-    );
+    dashboardPersistedStateMemory = nextState;
   }, [
     dialers,
     records,
@@ -767,6 +807,7 @@ export default function Dashboard() {
     totalCount,
     statusChart,
     statsSummary,
+    playbackBatchPerformance,
     flowBreakdown,
     statusMatrix,
     selectedDialer,
@@ -774,6 +815,7 @@ export default function Dashboard() {
     currentPage,
     pageSize,
     autoRefresh,
+    activeQuickRangeMinutes,
     appliedDateRange,
     draftDateRange,
   ]);
@@ -793,20 +835,43 @@ const recordsRangeEnd =
     ? 0
     : Math.min(pagination.page * pagination.page_size, pagination.total_records);
 
+  const topChartStatuses = useMemo(() => {
+    const totals = new Map<string, number>();
+
+    for (const status of statusChart.statuses) {
+      const total = statusChart.series.reduce(
+        (sum, point) => sum + Number(point[status] ?? 0),
+        0
+      );
+      totals.set(status, total);
+    }
+
+    return [...statusChart.statuses]
+      .sort((left, right) => (totals.get(right) ?? 0) - (totals.get(left) ?? 0))
+      .slice(0, 7);
+  }, [statusChart]);
+
   const chartConfig = useMemo<ChartConfig>(() => {
-    return statusChart.statuses.reduce<ChartConfig>((config, status, index) => {
+    return topChartStatuses.reduce<ChartConfig>((config, status, index) => {
       config[status] = {
         label: prettifyStatusLabel(status),
         color: getStatusColor(status, index),
       };
       return config;
     }, {});
-  }, [statusChart.statuses]);
+  }, [topChartStatuses]);
 
   const chartTitle = "Status Trends";
   const availableStatuses = statsSummary.status_counts.map((item) => item.status);
   const hasActiveStatusFilter = tableSelectedStatuses.length > 0;
   const StatusFilterIcon = hasActiveStatusFilter ? FunnelPlus : Funnel;
+
+  const applyQuickRange = (minutes: QuickRangeMinutes) => {
+    const nextRange = getQuickRangeDraft(minutes);
+    setActiveQuickRangeMinutes(minutes);
+    setAppliedDateRange(nextRange);
+    setDraftDateRange(nextRange);
+  };
 
   const toggleStatusFilter = (status: string, checked: boolean) => {
     setTableSelectedStatuses((current) => {
@@ -849,6 +914,11 @@ const recordsRangeEnd =
 
     const buildParams = (page: number, exportPageSize: number) => {
       const params = new URLSearchParams();
+      const effectiveDateRange =
+        activeQuickRangeMinutes === null
+          ? appliedDateRange
+          : getQuickRangeDraft(activeQuickRangeMinutes);
+
       if (selectedDialer !== "all") {
         params.set("dialer_id", selectedDialer);
       }
@@ -857,11 +927,11 @@ const recordsRangeEnd =
       }
       params.set("page", String(page));
       params.set("page_size", String(exportPageSize));
-      if (appliedDateRange.from) {
-        params.set("date_from", toIsoOrNull(appliedDateRange.from) ?? "");
+      if (effectiveDateRange.from) {
+        params.set("date_from", toIsoOrNull(effectiveDateRange.from) ?? "");
       }
-      if (appliedDateRange.to) {
-        params.set("date_to", toIsoOrNull(appliedDateRange.to) ?? "");
+      if (effectiveDateRange.to) {
+        params.set("date_to", toIsoOrNull(effectiveDateRange.to) ?? "");
       }
 
       return params;
@@ -924,11 +994,15 @@ const recordsRangeEnd =
       });
       const downloadUrl = URL.createObjectURL(csvBlob);
       const link = document.createElement("a");
-      const fromLabel = appliedDateRange.from
-        ? appliedDateRange.from.slice(0, 10)
+      const exportDateRange =
+        activeQuickRangeMinutes === null
+          ? appliedDateRange
+          : getQuickRangeDraft(activeQuickRangeMinutes);
+      const fromLabel = exportDateRange.from
+        ? exportDateRange.from.slice(0, 10)
         : "all-time";
-      const toLabel = appliedDateRange.to
-        ? appliedDateRange.to.slice(0, 10)
+      const toLabel = exportDateRange.to
+        ? exportDateRange.to.slice(0, 10)
         : "all-time";
 
       link.href = downloadUrl;
@@ -955,7 +1029,7 @@ const recordsRangeEnd =
     audioUrlsRef.current = audioUrls;
   }, [audioUrls]);
 
-  const handlePlayRecording = async (record: CallLogRecord) => {
+  const handlePlayRecording = async (record: PlayableRecording) => {
     if (!record.call_recording_link) {
       setAudioErrors((current) => ({
         ...current,
@@ -1088,7 +1162,7 @@ const recordsRangeEnd =
           }
         `}
       </style>
-      <div className="mx-auto max-w-7xl space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-2 motion-safe:duration-500">
+      <div className="mx-auto max-w-7xl space-y-5 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-2 motion-safe:duration-500">
         <div className="sticky top-0 z-20" ref={stickyControlsRef}>
           <div
             className={cn(
@@ -1108,7 +1182,11 @@ const recordsRangeEnd =
               <button
                 type="button"
                 onClick={() => {
-                  setDraftDateRange(appliedDateRange);
+                  setDraftDateRange(
+                    activeQuickRangeMinutes === null
+                      ? appliedDateRange
+                      : getQuickRangeDraft(activeQuickRangeMinutes)
+                  );
                   setIsDateDialogOpen(true);
                 }}
                 className="group flex min-h-14 items-center justify-between rounded-xl border border-border/45 bg-background/75 px-4 py-3 text-left backdrop-blur-xl transition-colors duration-200 hover:border-primary/50 hover:bg-accent/40 dark:border-white/8"
@@ -1150,7 +1228,6 @@ const recordsRangeEnd =
                 <div className="flex h-14 min-w-[170px] items-center gap-3 rounded-xl border border-border/45 bg-background/75 px-4 backdrop-blur-xl dark:border-white/8">
                   <div className="space-y-0.5">
                     <p className="text-sm font-medium">Auto refresh</p>
-                    <p className="text-xs text-muted-foreground">5 seconds</p>
                   </div>
                   <Switch
                     checked={autoRefresh}
@@ -1160,89 +1237,43 @@ const recordsRangeEnd =
                 </div>
               </div>
             </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/35 pt-3 dark:border-white/8">
+              {QUICK_RANGE_OPTIONS.map((minutes) => (
+                <Button
+                  key={minutes}
+                  type="button"
+                  size="sm"
+                  variant={activeQuickRangeMinutes === minutes ? "default" : "outline"}
+                  onClick={() => applyQuickRange(minutes)}
+                  className="h-8 rounded-full px-4"
+                  aria-pressed={activeQuickRangeMinutes === minutes}
+                >
+                  {minutes === 60
+                    ? "Last 1 hour"
+                    : minutes === 180
+                      ? "Last 3 hours"
+                      : `Last ${minutes} min`}
+                </Button>
+              ))}
+            </div>
           </div>
         </div>
 
-        <Card className="border-border/45 bg-card/94 dark:border-white/8">
-          <CardHeader className="space-y-2">
-            <CardTitle className="text-lg">Scope</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-3">
-              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
-                <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-                    Active Scope
-                  </p>
-                  {isLoading ? (
-                    <>
-                      <Skeleton className="h-6 w-36" />
-                      <Skeleton className="h-4 w-40" />
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-lg font-semibold">{selectedDialerLabel}</p>
-                      <p className="text-sm text-muted-foreground">{dateLabel}</p>
-                    </>
-                  )}
-                </CardContent>
-              </Card>
-              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
-                <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-                    Calls
-                  </p>
-                  {isLoading ? (
-                    <>
-                      <Skeleton className="h-8 w-20" />
-                      <Skeleton className="h-4 w-28" />
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-3xl font-semibold">{totalCount}</p>
-                      <p className="text-sm text-muted-foreground">Current scope</p>
-                    </>
-                  )}
-                </CardContent>
-              </Card>
-              <Card className="border-border/40 bg-background/72 shadow-none dark:border-white/8">
-                <CardContent className="flex min-h-28 flex-col justify-center gap-1 p-5">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-                    Latest Match
-                  </p>
-                  {isLoading ? (
-                    <>
-                      <Skeleton className="h-6 w-32" />
-                      <Skeleton className="h-4 w-44" />
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-lg font-semibold">
-                        {latestRecord?.dialer_name ?? "No records yet"}
-                      </p>
-                      <p className="text-sm text-muted-foreground">
-                        {latestRecord
-                          ? new Date(latestRecord.created_at).toLocaleString()
-                          : "No recent records"}
-                      </p>
-                    </>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-
-            {error && (
-              <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-                {error}
-              </div>
-            )}
-          </CardContent>
-        </Card>
+        {error && (
+          <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+            {error}
+          </div>
+        )}
 
         <Card className="border-border/70 bg-card/95 shadow-sm dark:border-white/10">
           <CardHeader className="space-y-2">
             <div className="flex items-center justify-between gap-3">
               <CardTitle className="text-lg">{chartTitle}</CardTitle>
+              {!isLoading && topChartStatuses.length > 0 && (
+                <span className="text-xs text-muted-foreground">
+                </span>
+              )}
             </div>
           </CardHeader>
           <CardContent>
@@ -1251,7 +1282,7 @@ const recordsRangeEnd =
                 <Skeleton className="h-4 w-44" />
                 <Skeleton className="h-[260px] w-full rounded-xl" />
               </div>
-            ) : statusChart.series.length > 0 && statusChart.statuses.length > 0 ? (
+            ) : statusChart.series.length > 0 && topChartStatuses.length > 0 ? (
               <ChartContainer
                 config={chartConfig}
                 className="h-[320px] w-full rounded-xl border border-border/60 bg-background/60 p-4 dark:border-white/10"
@@ -1309,7 +1340,7 @@ const recordsRangeEnd =
                     }
                   />
                   <ChartLegend content={<ChartLegendContent />} />
-                  {statusChart.statuses.map((status, index) => (
+                  {topChartStatuses.map((status, index) => (
                     <Line
                       key={status}
                       type="monotone"
@@ -1379,12 +1410,11 @@ const recordsRangeEnd =
                     </div>
                     {statsSummary.status_counts.map((statusItem, index) => {
                       const statusColor = getStatusColor(statusItem.status, index);
-                      const tileTextColor = getStatusTextColor(statusItem.status, index);
 
                       return (
                         <div
                           key={statusItem.status}
-                          className="relative rounded-xl border px-5 py-4 text-left transition-transform duration-200 hover:-translate-y-0.5"
+                          className="relative rounded-xl border border-l-4 px-5 py-4 text-left transition-colors duration-200 hover:bg-accent/20"
                           style={
                             statusItem.status.trim().toLowerCase() === "live"
                               ? getAnimatedLiveStatusCardStyle(statusColor)
@@ -1399,22 +1429,16 @@ const recordsRangeEnd =
                           >
                           <div className="flex items-center gap-2">
                             <p
-                              className="text-xs uppercase tracking-[0.16em]"
-                              style={{ color: tileTextColor, opacity: 0.92 }}
+                              className="text-xs font-medium uppercase tracking-[0.16em]"
+                              style={{ color: statusColor }}
                             >
                               {prettifyStatusLabel(statusItem.status)}
                             </p>
                           </div>
-                          <p
-                            className="mt-3 text-4xl font-semibold tracking-tight"
-                            style={{ color: tileTextColor }}
-                          >
+                          <p className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
                             {statusItem.count.toLocaleString()}
                           </p>
-                          <p
-                            className="mt-2 text-sm"
-                            style={{ color: tileTextColor, opacity: 0.84 }}
-                          >
+                          <p className="mt-2 text-sm text-muted-foreground">
                             {statusItem.percentage.toFixed(2)}%
                           </p>
                           </button>
@@ -1430,7 +1454,226 @@ const recordsRangeEnd =
 
         <Card className="border-border/70 bg-card/95 shadow-sm dark:border-white/10">
           <CardHeader className="space-y-2">
-            <CardTitle className="text-lg">Dialer Flow Breakdown</CardTitle>
+            <CardTitle className="text-lg">Playback Batch Performance</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {isLoading ? (
+              <div className="space-y-3">
+                <Skeleton className="h-[240px] w-full rounded-xl" />
+                <Skeleton className="h-12 w-full rounded-xl" />
+                <Skeleton className="h-12 w-full rounded-xl" />
+              </div>
+            ) : playbackBatchPerformance.length > 0 ? (
+              <div className="space-y-3">
+                {playbackBatchPerformance.map((dialer) => (
+                  <Collapsible
+                    key={dialer.dialer_id}
+                    className="rounded-xl border border-border/70 bg-background/70 dark:border-white/10"
+                  >
+                    <CollapsibleTrigger className="group flex w-full items-center justify-between px-4 py-3 text-left transition-colors duration-200 hover:bg-accent/30">
+                      <div>
+                        <p className="font-medium">{dialer.dialer_name}</p>
+                      </div>
+                      <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform duration-300 ease-out group-data-[state=open]:rotate-180" />
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="space-y-3 border-t px-4 py-4">
+                      {dialer.flows.map((flowItem) => {
+                        const playbackChartConfig = flowItem.batches.reduce<ChartConfig>(
+                          (config, batchItem, index) => {
+                            const key = `playback_batch_${dialer.dialer_id}_${flowItem.flow}_${batchItem.batch}`;
+                            config[key] = {
+                              label: `Batch ${batchItem.batch}`,
+                              color: getStatusColor(index),
+                            };
+                            return config;
+                          },
+                          {}
+                        );
+
+                        const playbackDonutData = flowItem.batches.map((batchItem) => ({
+                          key: `playback_batch_${dialer.dialer_id}_${flowItem.flow}_${batchItem.batch}`,
+                          name: `Batch ${batchItem.batch}`,
+                          batch: batchItem.batch,
+                          value: batchItem.count,
+                          percentage:
+                            flowItem.total_count > 0
+                              ? (batchItem.count / flowItem.total_count) * 100
+                              : 0,
+                          fill:
+                            playbackChartConfig[
+                              `playback_batch_${dialer.dialer_id}_${flowItem.flow}_${batchItem.batch}`
+                            ]?.color,
+                          sampleRecording: batchItem.sample_recording,
+                        }));
+
+                        return (
+                          <Collapsible
+                            key={`${dialer.dialer_id}-${flowItem.flow}`}
+                            className="rounded-xl border border-border/60 bg-card/70 dark:border-white/10"
+                          >
+                            <CollapsibleTrigger className="group flex w-full items-center justify-between px-4 py-3 text-left transition-colors duration-200 hover:bg-accent/30">
+                              <div>
+                                <p className="font-medium">{prettifyStatusLabel(flowItem.flow)}</p>
+                              </div>
+                              <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform duration-300 ease-out group-data-[state=open]:rotate-180" />
+                            </CollapsibleTrigger>
+                            <CollapsibleContent className="border-t px-4 py-4">
+                              {playbackDonutData.length > 0 ? (
+                                <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
+                                  <ChartContainer
+                                    config={playbackChartConfig}
+                                    className="h-[240px] w-full rounded-xl border border-border/60 bg-background/70 p-4 dark:border-white/10"
+                                  >
+                                    <PieChart>
+                                      <ChartTooltip
+                                        content={
+                                          <ChartTooltipContent
+                                            nameKey="key"
+                                            formatter={(value, name, item) => {
+                                              const sliceColor = item.payload.fill;
+                                              const percentage = Number(item.payload.percentage ?? 0);
+
+                                              return [
+                                                <div className="flex items-center gap-2">
+                                                  <span
+                                                    className="font-mono tabular-nums"
+                                                    style={{ color: sliceColor }}
+                                                  >
+                                                    {Number(value).toLocaleString()}
+                                                  </span>
+                                                  <span
+                                                    className="text-muted-foreground"
+                                                    style={{ color: sliceColor }}
+                                                  >
+                                                    ({percentage.toFixed(1)}%)
+                                                  </span>
+                                                </div>,
+                                                <span style={{ color: sliceColor }}>{String(name)}</span>,
+                                              ];
+                                            }}
+                                          />
+                                        }
+                                      />
+                                      <Pie
+                                        data={playbackDonutData}
+                                        dataKey="value"
+                                        nameKey="name"
+                                        innerRadius={54}
+                                        outerRadius={86}
+                                        paddingAngle={3}
+                                        strokeWidth={0}
+                                        animationDuration={700}
+                                      >
+                                        {playbackDonutData.map((entry) => (
+                                          <Cell key={entry.key} fill={entry.fill} />
+                                        ))}
+                                      </Pie>
+                                      <ChartLegend content={<ChartLegendContent nameKey="key" />} />
+                                    </PieChart>
+                                  </ChartContainer>
+
+                                  <div className="grid gap-3 content-start">
+                                    {playbackDonutData.map((entry) => (
+                                      (() => {
+                                        const sampleRecording = entry.sampleRecording;
+
+                                        return (
+                                          <div
+                                            key={entry.key}
+                                            className="rounded-xl border border-border/60 bg-background/60 px-4 py-3 dark:border-white/10"
+                                          >
+                                            <div className="flex items-center justify-between gap-4">
+                                              <div className="flex items-center gap-3">
+                                                <span
+                                                  className="h-3 w-3 rounded-full"
+                                                  style={{ backgroundColor: entry.fill }}
+                                                />
+                                                <span className="font-medium">{entry.name}</span>
+                                              </div>
+                                              <div className="text-right">
+                                                <p className="font-mono tabular-nums">
+                                                  {entry.value.toLocaleString()}
+                                                </p>
+                                                <p className="text-xs text-muted-foreground">
+                                                  {entry.percentage.toFixed(1)}%
+                                                </p>
+                                              </div>
+                                            </div>
+                                            <div className="mt-3 border-t border-border/50 pt-3 dark:border-white/10">
+                                              <p className="mb-2 text-xs uppercase tracking-[0.16em] text-muted-foreground">
+                                                Sample Recording
+                                              </p>
+                                              {sampleRecording ? (
+                                                <>
+                                                  {audioUrls[sampleRecording.call_uuid] ? (
+                                                    <audio
+                                                      controls
+                                                      preload="none"
+                                                      className="h-10 w-full"
+                                                      src={audioUrls[sampleRecording.call_uuid]}
+                                                    />
+                                                  ) : (
+                                                    <div className="flex items-center justify-between gap-3">
+                                                      <span className="text-sm text-muted-foreground">
+                                                        Call {sampleRecording.call_id}
+                                                      </span>
+                                                      <Button
+                                                        type="button"
+                                                        variant="outline"
+                                                        size="sm"
+                                                        onClick={() => void handlePlayRecording(sampleRecording)}
+                                                        disabled={loadingAudioId === sampleRecording.call_uuid}
+                                                        className="gap-2"
+                                                      >
+                                                        <Play className="h-4 w-4" />
+                                                        {loadingAudioId === sampleRecording.call_uuid
+                                                          ? "Loading..."
+                                                          : "Play sample"}
+                                                      </Button>
+                                                    </div>
+                                                  )}
+                                                  {audioErrors[sampleRecording.call_uuid] ? (
+                                                    <p className="mt-2 text-xs text-destructive">
+                                                      {audioErrors[sampleRecording.call_uuid]}
+                                                    </p>
+                                                  ) : null}
+                                                </>
+                                              ) : (
+                                                <p className="text-sm text-muted-foreground">
+                                                  No sample recording available for this batch.
+                                                </p>
+                                              )}
+                                            </div>
+                                          </div>
+                                        );
+                                      })()
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="rounded-xl border border-dashed border-border/60 bg-background/60 px-4 py-6 text-sm text-muted-foreground dark:border-white/10">
+                                  No playback batch data is available for this flow.
+                                </div>
+                              )}
+                            </CollapsibleContent>
+                          </Collapsible>
+                        );
+                      })}
+                    </CollapsibleContent>
+                  </Collapsible>
+                ))}
+              </div>
+            ) : (
+              <div className="flex h-[220px] items-center justify-center rounded-xl border border-dashed border-border/70 bg-background/60 text-sm text-muted-foreground dark:border-white/10">
+                No RAXFER batch data is available for the current filter.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-border/70 bg-card/95 shadow-sm dark:border-white/10">
+          <CardHeader className="space-y-2">
+            <CardTitle className="text-lg">Call Distribution</CardTitle>
           </CardHeader>
           <CardContent>
             {isLoading ? (
@@ -1693,7 +1936,14 @@ const recordsRangeEnd =
                         <Download className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>Download</TooltipContent>
+                    <TooltipContent
+                      side="top"
+                      align="center"
+                      sideOffset={8}
+                      className="[&>span]:-bottom-1 [&>span]:left-1/2 [&>span]:top-auto [&>span]:-translate-x-1/2 [&>span]:translate-y-0"
+                    >
+                      Download call logs
+                    </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
               </div>
@@ -1964,6 +2214,7 @@ const recordsRangeEnd =
               type="button"
               variant="outline"
               onClick={() => {
+                setActiveQuickRangeMinutes(null);
                 setDraftDateRange({ from: "", to: "" });
                 setAppliedDateRange({ from: "", to: "" });
                 setIsDateDialogOpen(false);
@@ -1974,6 +2225,7 @@ const recordsRangeEnd =
             <Button
               type="button"
               onClick={() => {
+                setActiveQuickRangeMinutes(null);
                 setAppliedDateRange(draftDateRange);
                 setIsDateDialogOpen(false);
               }}

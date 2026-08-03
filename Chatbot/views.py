@@ -1660,6 +1660,7 @@ def dashboard_analytics_view(request):
                     "statuses": [],
                     "rows": [],
                 },
+                "playback_batch_performance": [],
                 "flow_breakdown": [],
             },
         }
@@ -1689,6 +1690,24 @@ def dashboard_analytics_view(request):
         filtered_logs.values("dialer_id", "status").annotate(count=Count("id"))
     )
 
+    playback_batch_rows = list(
+        filtered_logs.filter(status__iexact="RAXFER")
+        .values("dialer_id", "flow", "batch")
+        .annotate(count=Count("id"))
+        .order_by("dialer_id", "flow", "batch")
+    )
+
+    playback_sample_rows = filtered_logs.filter(
+        status__iexact="RAXFER",
+    ).values(
+        "dialer_id",
+        "flow",
+        "batch",
+        "call_uuid",
+        "call_id",
+        "call_recording_link",
+    )
+
     breakdown_rows = list(
         filtered_logs.values("dialer_id", "flow", "batch").annotate(count=Count("id"))
     )
@@ -1698,6 +1717,9 @@ def dashboard_analytics_view(request):
     ]
     status_matrix_rows = [
         row for row in status_matrix_rows if row["count"]
+    ]
+    playback_batch_rows = [
+        row for row in playback_batch_rows if row["count"]
     ]
     breakdown_rows = [
         row for row in breakdown_rows if row["count"]
@@ -1717,6 +1739,86 @@ def dashboard_analytics_view(request):
             row["batch"],
         )
     )
+
+    playback_breakdown_lookup = {}
+    playback_sample_lookup = {}
+
+    for row in playback_sample_rows.iterator():
+        sample_key = (
+            row["dialer_id"],
+            row["flow"] or "unknown",
+            row["batch"],
+        )
+
+        seen_count = playback_sample_lookup.get(sample_key, {}).get("seen_count", 0) + 1
+        should_replace = sample_key not in playback_sample_lookup or random.randint(1, seen_count) == 1
+
+        if should_replace:
+            recording_link = row["call_recording_link"] or _build_call_recording_link(
+                row["call_uuid"]
+            )
+            playback_sample_lookup[sample_key] = {
+                "seen_count": seen_count,
+                "sample_recording": {
+                    "call_uuid": str(row["call_uuid"]),
+                    "call_id": row["call_id"],
+                    "call_recording_link": recording_link,
+                },
+            }
+        else:
+            playback_sample_lookup[sample_key]["seen_count"] = seen_count
+
+    for row in playback_batch_rows:
+        dialer_id = row["dialer_id"]
+        dialer_name = scope["active_dialer_lookup"].get(dialer_id, "")
+        flow_name = row["flow"] or "unknown"
+        batch_value = row["batch"]
+        count = row["count"]
+
+        if dialer_id not in playback_breakdown_lookup:
+            playback_breakdown_lookup[dialer_id] = {
+                "dialer_id": dialer_id,
+                "dialer_name": dialer_name,
+                "total_count": 0,
+                "flows": {},
+            }
+
+        dialer_group = playback_breakdown_lookup[dialer_id]
+        dialer_group["total_count"] += count
+
+        if flow_name not in dialer_group["flows"]:
+            dialer_group["flows"][flow_name] = {
+                "flow": flow_name,
+                "total_count": 0,
+                "batches": [],
+            }
+
+        flow_group = dialer_group["flows"][flow_name]
+        flow_group["total_count"] += count
+        flow_group["batches"].append(
+            {
+                "batch": batch_value,
+                "count": count,
+                "sample_recording": playback_sample_lookup.get(
+                    (dialer_id, flow_name, batch_value),
+                    {},
+                ).get("sample_recording"),
+            }
+        )
+
+    playback_batch_performance = []
+    for dialer_group in playback_breakdown_lookup.values():
+        playback_batch_performance.append(
+            {
+                "dialer_id": dialer_group["dialer_id"],
+                "dialer_name": dialer_group["dialer_name"],
+                "total_count": dialer_group["total_count"],
+                "flows": [
+                    dialer_group["flows"][flow_name]
+                    for flow_name in sorted(dialer_group["flows"].keys())
+                ],
+            }
+        )
 
     dialer_lookup = {}
     for row in breakdown_rows:
@@ -1836,6 +1938,7 @@ def dashboard_analytics_view(request):
                 "statuses": matrix_statuses,
                 "rows": status_matrix,
             },
+            "playback_batch_performance": playback_batch_performance,
             "flow_breakdown": flow_breakdown,
         },
     }

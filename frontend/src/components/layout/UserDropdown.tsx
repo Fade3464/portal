@@ -10,6 +10,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { LogOut, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getCsrfToken } from "@/lib/csrf";
+import { clearDashboardPersistedState } from "@/pages/Dashboard";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 
@@ -34,6 +35,7 @@ export default function UserDropdown({
     });
     if (res.ok) {
       toast.success("Logged out");
+      clearDashboardPersistedState();
       localStorage.removeItem("empdetails_data");
       navigate("/login");
     } else {
