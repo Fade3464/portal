@@ -17,24 +17,17 @@ const TooltipContent = React.forwardRef<
       ref={ref}
       sideOffset={sideOffset}
       className={cn(
-        // Base styling
-        "relative z-50 rounded-md border border-border px-3 py-1.5 text-xs font-medium shadow-md",
-        // Light mode
-        "bg-white text-gray-900",
-        // Dark mode
-        "dark:bg-[#111] dark:text-gray-100 dark:border-gray-700",
-        // Animation
+        "relative z-50 rounded-md border border-border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-md",
         "animate-in fade-in-0 zoom-in-95 transition-all duration-150",
         className
       )}
       {...props}
     >
       {children}
-      {/* Custom arrow */}
       <span
         className={cn(
           "absolute left-[-5px] top-1/2 -translate-y-1/2 w-2 h-2 rotate-45",
-          "bg-white dark:bg-[#111] border-l border-t border-border dark:border-gray-700 shadow-sm"
+          "border-l border-t border-border bg-popover shadow-sm"
         )}
       />
     </TooltipPrimitive.Content>

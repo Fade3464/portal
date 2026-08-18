@@ -90,7 +90,7 @@ export default function AuthPage() {
 
   return (
     <div className="relative flex h-screen w-screen items-center justify-center overflow-hidden bg-background text-foreground transition-colors duration-500">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(15,118,110,0.12),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(37,99,235,0.12),transparent_32%)]" />
+      <div className="app-scheme-atmosphere pointer-events-none absolute inset-0" />
       <div className="absolute top-6 right-6">
         <Button
           variant="outline"
@@ -122,12 +122,12 @@ export default function AuthPage() {
           </Alert>
         )}
 
-        <div className="pointer-events-none absolute inset-x-0 top-0 h-32 bg-[radial-gradient(circle_at_top,rgba(15,118,110,0.14),transparent_68%)] dark:bg-[radial-gradient(circle_at_top,rgba(45,212,191,0.12),transparent_68%)]" />
+        <div className="app-scheme-accent-glow pointer-events-none absolute inset-x-0 top-0 h-32" />
 
         <div className="flex min-h-[460px] w-full flex-col justify-center p-8 sm:p-9">
           <div className="mb-8 flex flex-col items-center text-center">
-            <div className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-2xl border border-border/60 bg-background/80 shadow-sm dark:border-white/10 dark:bg-white/5">
-              <ShieldCheck className="h-6 w-6 text-teal-600 dark:text-teal-400" />
+            <div className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-2xl border border-border/60 bg-background/80 shadow-sm">
+              <ShieldCheck className="h-6 w-6 text-primary" />
             </div>
             <h2 className="text-3xl font-semibold tracking-tight">Sign in</h2>
             <p className="mt-2 text-sm text-muted-foreground">

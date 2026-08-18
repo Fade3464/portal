@@ -234,7 +234,7 @@ export default function CallLookupPage() {
         <CardContent>
           {!hasSearched ? (
             <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border/70 bg-background/40 text-center dark:border-white/10">
-              <Search className="h-6 w-6 text-muted-foreground" />
+              <Search className="h-6 w-6 text-primary/70" />
               <p className="text-sm text-muted-foreground">Search by caller id</p>
             </div>
           ) : result && result.exists ? (
@@ -242,14 +242,14 @@ export default function CallLookupPage() {
               <div className="grid gap-3 sm:grid-cols-3">
                 <div className="rounded-2xl border border-border/70 bg-background/60 px-4 py-3 dark:border-white/10">
                   <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                    <PhoneCall className="h-3.5 w-3.5" />
+                    <PhoneCall className="h-3.5 w-3.5 text-primary" />
                     Caller_ID
                   </div>
                   <p className="mt-2 font-mono text-lg font-semibold">{result.call_id}</p>
                 </div>
                 <div className="rounded-2xl border border-border/70 bg-background/60 px-4 py-3 dark:border-white/10">
                   <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                    <Waves className="h-3.5 w-3.5" />
+                    <Waves className="h-3.5 w-3.5 text-primary" />
                     Records
                   </div>
                   <p className="mt-2 text-lg font-semibold">{result.count}</p>
@@ -330,7 +330,7 @@ export default function CallLookupPage() {
             </div>
           ) : (
             <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border/70 bg-background/40 text-center dark:border-white/10">
-              <SearchX className="h-6 w-6 text-muted-foreground" />
+              <SearchX className="h-6 w-6 text-primary/70" />
               <p className="text-sm text-muted-foreground">No matching records</p>
             </div>
           )}

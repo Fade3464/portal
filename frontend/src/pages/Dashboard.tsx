@@ -1147,7 +1147,7 @@ const recordsRangeEnd =
   }, []);
 
   return (
-    <div className="min-h-full bg-[radial-gradient(circle_at_top_left,rgba(15,118,110,0.08),transparent_28%),radial-gradient(circle_at_top_right,rgba(37,99,235,0.08),transparent_26%)] px-4 py-6 text-foreground sm:px-6 sm:py-8">
+    <div className="app-scheme-atmosphere min-h-full px-4 py-6 text-foreground sm:px-6 sm:py-8">
       <style>
         {`
           @keyframes liveTileGlow {
@@ -1625,7 +1625,7 @@ const recordsRangeEnd =
                                                         disabled={loadingAudioId === sampleRecording.call_uuid}
                                                         className="gap-2"
                                                       >
-                                                        <Play className="h-4 w-4" />
+                                                        <Play className="h-4 w-4 text-primary" />
                                                         {loadingAudioId === sampleRecording.call_uuid
                                                           ? "Loading..."
                                                           : "Play sample"}
@@ -1933,7 +1933,7 @@ const recordsRangeEnd =
                         className="h-9 w-9 rounded-lg border-border/70 bg-background/80 dark:border-white/10"
                         aria-label="Download call logs"
                       >
-                        <Download className="h-4 w-4" />
+                        <Download className="h-4 w-4 text-primary" />
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent
@@ -1981,7 +1981,7 @@ const recordsRangeEnd =
                                     }`}
                                     aria-label="Filter status column"
                                   >
-                                    <StatusFilterIcon className="h-4 w-4" />
+                                    <StatusFilterIcon className="h-4 w-4 text-primary" />
                                   </Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="start" className="w-56">
@@ -2086,7 +2086,7 @@ const recordsRangeEnd =
                                     className="h-9 w-9 rounded-full border-border/70 bg-background/80 dark:border-white/10"
                                     aria-label={`Play recording for call ${record.call_id}`}
                                   >
-                                    <Play className="h-4 w-4" />
+                                    <Play className="h-4 w-4 text-primary" />
                                   </Button>
                                   {loadingAudioId === record.call_uuid && (
                                     <span className="text-[11px] text-muted-foreground">

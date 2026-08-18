@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, Fingerprint, Mail, ShieldCheck, Smartphone, UserRound } from "lucide-react";
+import { ArrowRight, CheckCircle2, Fingerprint, Mail, Palette, ShieldCheck, Smartphone, UserRound } from "lucide-react";
 import QRCode from "qrcode";
 import { toast } from "sonner";
 
@@ -21,6 +21,10 @@ import {
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
 import { SpinnerCustom } from "@/components/ui/spinner";
+import {
+  COLOR_SCHEME_OPTIONS,
+  useTheme,
+} from "@/context/ThemeProvider";
 import { getCsrfToken } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 
@@ -101,6 +105,7 @@ function getPasswordStrengthLabel(password: string) {
 }
 
 export default function AccountPage() {
+  const { colorScheme, setColorScheme } = useTheme();
   const [profile, setProfile] = useState<AccountProfile>(emptyProfile);
   const [form, setForm] = useState({
     first_name: "",
@@ -455,18 +460,75 @@ export default function AccountPage() {
             <div className="grid gap-4 text-sm sm:grid-cols-2">
               <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
                 <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                  <Fingerprint className="h-3.5 w-3.5" />
+                  <Fingerprint className="h-3.5 w-3.5 text-primary" />
                   Username
                 </div>
                 <p className="mt-1 font-medium">{profile.username}</p>
               </div>
               <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
                 <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                  <Mail className="h-3.5 w-3.5" />
+                  <Mail className="h-3.5 w-3.5 text-primary" />
                   Client
                 </div>
                 <p className="mt-1 font-medium">{profile.client_name}</p>
               </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
+          <CardHeader className="pb-4">
+            <div className="flex items-start gap-3">
+              <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <Palette className="h-5 w-5" />
+              </div>
+              <div className="space-y-1">
+                <CardTitle className="text-xl">Personalize</CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  Choose a color scheme for both light and dark mode. Your selection is saved in this browser.
+                </p>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+              {COLOR_SCHEME_OPTIONS.map((option) => {
+                const isSelected = colorScheme === option.id;
+
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => setColorScheme(option.id)}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      "rounded-2xl border bg-background/65 p-4 text-left transition-colors hover:bg-accent/45 dark:border-white/10",
+                      isSelected
+                        ? "border-primary ring-2 ring-primary/15"
+                        : "border-border/70"
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-semibold">{option.name}</span>
+                      {isSelected ? (
+                        <CheckCircle2 className="h-4 w-4 text-primary" />
+                      ) : null}
+                    </div>
+                    <div className="mt-4 flex items-center gap-2" aria-hidden="true">
+                      {option.swatches.map((swatch) => (
+                        <span
+                          key={swatch}
+                          className="h-6 flex-1 rounded-full border border-black/10 shadow-sm dark:border-white/10"
+                          style={{ backgroundColor: swatch }}
+                        />
+                      ))}
+                    </div>
+                    <p className="mt-3 text-sm text-muted-foreground">
+                      {option.description}
+                    </p>
+                  </button>
+                );
+              })}
             </div>
           </CardContent>
         </Card>
@@ -556,7 +618,7 @@ export default function AccountPage() {
                         {isDone ? <CheckCircle2 className="h-4 w-4" /> : step}
                       </div>
                       {step < 3 && (
-                        <div className="h-px flex-1 bg-border dark:bg-white/10" />
+                        <div className="h-px flex-1 bg-border" />
                       )}
                     </div>
                   );
@@ -681,13 +743,13 @@ export default function AccountPage() {
           </CardHeader>
           <CardContent className="space-y-5">
             {profile.recovery_authenticator_enabled ? (
-              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.08] px-5 py-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] dark:bg-black">
+              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.08] px-5 py-5 shadow-sm">
                 <div className="flex items-center gap-4">
-                  <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/12 text-emerald-700 dark:bg-white/8 dark:text-white">
+                  <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
                     <Smartphone className="h-5 w-5" />
                   </div>
                   <div className="space-y-3">
-                    <p className="text-2xl font-semibold tracking-tight text-foreground dark:text-white">
+                    <p className="text-2xl font-semibold tracking-tight text-foreground">
                       Recovery Authenticator
                     </p>
                     <div className="inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">

@@ -76,7 +76,7 @@ export default function UserDropdown({
         <DropdownMenuLabel>My Account</DropdownMenuLabel>
 
         <DropdownMenuItem onClick={() => navigate("/account")}>
-          <Settings className="h-4 w-4 mr-2" />
+          <Settings className="mr-2 h-4 w-4 text-primary" />
           Account
         </DropdownMenuItem>
 

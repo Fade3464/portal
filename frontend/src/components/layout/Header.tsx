@@ -34,12 +34,12 @@ export default function Header({ collapsed, title = "Dashboard" }: HeaderProps) 
         size="icon"
         variant="outline"
         onClick={toggleTheme}
-        className="rounded-full border shadow dark:border-gray-700"
+        className="rounded-full border-border bg-background/80 text-foreground shadow"
       >
         {resolvedTheme === "dark" ? (
-          <Sun className="h-5 w-5 text-yellow-300" />
+          <Sun className="h-5 w-5 text-primary" />
         ) : (
-          <Moon className="h-5 w-5 text-gray-700" />
+          <Moon className="h-5 w-5 text-primary" />
         )}
       </Button>
     </header>

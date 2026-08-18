@@ -89,7 +89,7 @@ export default function Sidebar({
           variant="ghost"
           size="icon"
           onClick={() => setCollapsed(!collapsed)}
-          className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors duration-200 hover:bg-muted"
+          className="flex h-10 w-10 shrink-0 items-center justify-center text-primary transition-colors duration-200 hover:bg-muted"
         >
           <PanelLeftDashed
             className={cn(
@@ -140,7 +140,7 @@ export default function Sidebar({
                           "h-4 w-4 shrink-0",
                           isActive
                             ? "text-primary"
-                            : "text-foreground group-hover:text-primary"
+                            : "text-primary/75 group-hover:text-primary"
                         )}
                       />
 
