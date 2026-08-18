@@ -975,6 +975,32 @@ def preload_dialer_routes_view(request):
     )
 
 
+@require_GET
+def dialer_credentials_view(request):
+    token_error = _require_call_log_api_token(request)
+    if token_error:
+        return token_error
+
+    dialers = list(
+        Dialer.objects.order_by("dialer_name", "id").values(
+            "dialer_name",
+            "api_user",
+            "api_password",
+            "agent_api_url",
+            "non_agent_api_url",
+        )
+    )
+    response = _json_response(
+        {
+            "dialer_count": len(dialers),
+            "dialers": dialers,
+        }
+    )
+    response["Cache-Control"] = "no-store"
+    response["Pragma"] = "no-cache"
+    return response
+
+
 @csrf_exempt
 @require_POST
 def request_route_view(request):
