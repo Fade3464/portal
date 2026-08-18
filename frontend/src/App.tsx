@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Toaster } from "sonner";
 
 import SidebarLayout from "./components/layout/SidebarLayout";
@@ -10,6 +10,28 @@ import AuthPage from "./pages/AuthPage";
 import AccountPage from "./pages/AccountPage";
 import CallLookupPage from "./pages/CallLookupPage";
 import Dashboard from "./pages/Dashboard";
+
+const PAGE_TITLES: Record<string, string> = {
+  "/login": "Sign In",
+  "/dashboard": "Dashboard",
+  "/call-lookup": "Call Lookup",
+  "/account": "Account",
+};
+
+function PageTitle() {
+  const location = useLocation();
+
+  useEffect(() => {
+    const matchingPath = Object.keys(PAGE_TITLES).find(
+      (path) => location.pathname === path || location.pathname.startsWith(`${path}/`)
+    );
+    const pageTitle = matchingPath ? PAGE_TITLES[matchingPath] : null;
+
+    document.title = pageTitle ? `${pageTitle} | Pulsar Portal` : "Pulsar Portal";
+  }, [location.pathname]);
+
+  return null;
+}
 
 function RootRedirect() {
   const navigate = useNavigate();
@@ -85,6 +107,7 @@ function AppRoutes() {
 export default function App() {
   return (
     <ThemeProvider>
+      <PageTitle />
       <Toaster theme="system" richColors position="top-right" />
       <AppRoutes />
     </ThemeProvider>

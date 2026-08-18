@@ -99,10 +99,6 @@ export default function SidebarLayout() {
     return "Dashboard";
   }, [location.pathname]);
 
-  useEffect(() => {
-    document.title = `${headerTitle} | Portal`;
-  }, [headerTitle]);
-
   if (loading || !sidebarReady) {
     return (
       <div className="flex min-h-screen items-center justify-center">

@@ -49,6 +49,87 @@ Replace `portal` if the systemd unit has a different name. No cron change is nee
 7. Enable the policy in admin. Start with one low-risk dialer and monitor API and
    Gunicorn logs before enabling another.
 
+## Worked Django Admin Example
+
+Target distribution:
+
+- Flow `A`: 60% of calls, split equally between batches 1 and 2.
+- Flow `B`: 40% of calls, split 50%/30%/20% between batches 1, 2, and 3.
+- Route `10.0.0.1`: 60%; route `10.0.0.2`: 40%.
+
+Create the required authentication user and **Client** first. Every object below
+must use that same client.
+
+Create the legacy **Dialer** row before the weighted hierarchy. Example values:
+
+| Field | Example |
+| --- | --- |
+| Dialer name | `Medicare Dialer 01` |
+| Client | `Acme Calls` |
+| Project | `Medicare Legacy` |
+| Flow | `A` |
+| Batch | `1,2` |
+| Route IP | `10.0.0.1,10.0.0.2` |
+| Active | Yes |
+
+Complete its API URLs, API credentials, transfer extension, and agent count as
+normal. These project/flow/batch/route fields remain the automatic fallback if the
+weighted policy is disabled or invalid.
+
+Create **Routing project** `Medicare Playback` for client `Acme Calls`. Add these
+flows in its inline rows:
+
+| Flow | Weight | Active |
+| --- | ---: | --- |
+| `A` | 60 | Yes |
+| `B` | 40 | Yes |
+
+Open **Routing flows**, select `A`, and add:
+
+| Batch value | Weight | Active |
+| ---: | ---: | --- |
+| 1 | 50 | Yes |
+| 2 | 50 | Yes |
+
+Open flow `B` and add:
+
+| Batch value | Weight | Active |
+| ---: | ---: | --- |
+| 1 | 50 | Yes |
+| 2 | 30 | Yes |
+| 3 | 20 | Yes |
+
+Create **Dialer routing policy**, select `Medicare Dialer 01` and
+`Medicare Playback`, and leave **Enabled** unchecked. Add one endpoint per inline
+row:
+
+| Route IP | Weight | Active |
+| --- | ---: | --- |
+| `10.0.0.1` | 60 | Yes |
+| `10.0.0.2` | 40 | Yes |
+
+Save it disabled, validate it in the container, and then enable it:
+
+```bash
+docker compose --env-file .env.production exec backend \
+  python manage.py validate_routing_policies \
+  --include-disabled --dialer "Medicare Dialer 01"
+```
+
+The expected long-run assignment is:
+
+| Flow and batch | All calls |
+| --- | ---: |
+| A / Batch 1 | 30% |
+| A / Batch 2 | 30% |
+| B / Batch 1 | 20% |
+| B / Batch 2 | 12% |
+| B / Batch 3 | 8% |
+
+Route selection is independent of flow and batch: approximately 60% of all route
+requests use `10.0.0.1` and 40% use `10.0.0.2`. The current model does not assign a
+different route-IP distribution to each individual flow or batch.
+
 ## Rollback
 
 Turn off `enabled` on the dialer's routing policy. The next request uses the legacy

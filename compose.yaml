@@ -164,6 +164,7 @@ services:
     volumes:
       - static_data:/srv/static:ro
       - media_data:/srv/media:ro
+      - ${RECORDINGS_HOST_PATH:-/srv/ingress_records}:/srv/recordings:ro
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
       interval: 15s
