@@ -1,6 +1,17 @@
 from django.contrib import admin
 
-from .models import BlacklistedNumbers, CallLog, Client, Dialer, RESTAPITOKENS
+from .models import (
+    BlacklistedNumbers,
+    CallLog,
+    Client,
+    Dialer,
+    DialerRoutingPolicy,
+    RESTAPITOKENS,
+    RoutingBatch,
+    RoutingEndpoint,
+    RoutingFlow,
+    RoutingProject,
+)
 
 
 @admin.register(Client)
@@ -23,6 +34,75 @@ class DialerAdmin(admin.ModelAdmin):
     )
     list_filter = ("client", "flow", "active")
     search_fields = ("dialer_name", "project", "route_ip", "flow")
+
+
+class RoutingFlowInline(admin.TabularInline):
+    model = RoutingFlow
+    extra = 1
+    fields = ("name", "weight", "active")
+
+
+@admin.register(RoutingProject)
+class RoutingProjectAdmin(admin.ModelAdmin):
+    list_display = ("name", "client", "active", "flow_count")
+    list_filter = ("client", "active")
+    search_fields = ("name", "client__client_name")
+    inlines = (RoutingFlowInline,)
+
+    @admin.display(description="Flows")
+    def flow_count(self, obj):
+        return obj.flows.count()
+
+
+class RoutingBatchInline(admin.TabularInline):
+    model = RoutingBatch
+    extra = 1
+    fields = ("value", "weight", "active")
+
+
+@admin.register(RoutingFlow)
+class RoutingFlowAdmin(admin.ModelAdmin):
+    list_display = ("name", "project", "weight", "active", "batch_count")
+    list_filter = ("project__client", "project", "active")
+    search_fields = ("name", "project__name")
+    inlines = (RoutingBatchInline,)
+
+    @admin.display(description="Batches")
+    def batch_count(self, obj):
+        return obj.batches.count()
+
+
+@admin.register(RoutingBatch)
+class RoutingBatchAdmin(admin.ModelAdmin):
+    list_display = ("value", "flow", "weight", "active")
+    list_filter = ("flow__project", "flow", "active")
+    search_fields = ("flow__name", "flow__project__name")
+
+
+class RoutingEndpointInline(admin.TabularInline):
+    model = RoutingEndpoint
+    extra = 1
+    fields = ("route_ip", "weight", "active")
+
+
+@admin.register(DialerRoutingPolicy)
+class DialerRoutingPolicyAdmin(admin.ModelAdmin):
+    list_display = ("dialer", "project", "enabled", "endpoint_count")
+    list_filter = ("enabled", "project")
+    search_fields = ("dialer__dialer_name", "project__name")
+    autocomplete_fields = ("dialer", "project")
+    inlines = (RoutingEndpointInline,)
+
+    @admin.display(description="Route IPs")
+    def endpoint_count(self, obj):
+        return obj.endpoints.count()
+
+
+@admin.register(RoutingEndpoint)
+class RoutingEndpointAdmin(admin.ModelAdmin):
+    list_display = ("route_ip", "policy", "weight", "active")
+    list_filter = ("policy__dialer", "active")
+    search_fields = ("route_ip", "policy__dialer__dialer_name")
 
 
 @admin.register(CallLog)

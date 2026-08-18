@@ -29,6 +29,7 @@ def preload_dialer_route_map():
 
     try:
         for (
+            dialer_id,
             dialer_name,
             route_ip,
             project,
@@ -40,6 +41,7 @@ def preload_dialer_route_map():
             api_user,
             api_password,
         ) in Dialer.objects.values_list(
+            "id",
             "dialer_name",
             "route_ip",
             "project",
@@ -56,6 +58,7 @@ def preload_dialer_route_map():
                 continue
 
             route_map[normalized_name] = {
+                "dialer_id": dialer_id,
                 "dialer_name": dialer_name,
                 "route_ips": parse_route_ip_values(route_ip),
                 "project": project,

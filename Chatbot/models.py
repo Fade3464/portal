@@ -1,6 +1,7 @@
 import uuid
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
@@ -63,6 +64,210 @@ class Dialer(models.Model):
 
     def __str__(self) -> str:
         return self.dialer_name
+
+
+class RoutingProject(models.Model):
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="routing_projects",
+    )
+    name = models.CharField(max_length=255)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["client__client_name", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                name="routing_project_client_name_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.client.client_name} / {self.name}"
+
+
+class RoutingFlow(models.Model):
+    project = models.ForeignKey(
+        RoutingProject,
+        on_delete=models.CASCADE,
+        related_name="flows",
+    )
+    name = models.CharField(max_length=255)
+    weight = models.PositiveIntegerField(
+        default=1,
+        validators=[MinValueValidator(1)],
+        help_text="Relative distribution weight. For example, use 60 and 40 for a 60/40 split.",
+    )
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["project__name", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "name"],
+                name="routing_flow_project_name_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.project.name} / {self.name}"
+
+
+class RoutingBatch(models.Model):
+    flow = models.ForeignKey(
+        RoutingFlow,
+        on_delete=models.CASCADE,
+        related_name="batches",
+    )
+    value = models.IntegerField()
+    weight = models.PositiveIntegerField(
+        default=1,
+        validators=[MinValueValidator(1)],
+        help_text="Relative distribution weight within this flow.",
+    )
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["flow__project__name", "flow__name", "value"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["flow", "value"],
+                name="routing_batch_flow_value_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.flow} / Batch {self.value}"
+
+
+class DialerRoutingPolicy(models.Model):
+    dialer = models.OneToOneField(
+        Dialer,
+        on_delete=models.CASCADE,
+        related_name="routing_policy",
+    )
+    project = models.ForeignKey(
+        RoutingProject,
+        on_delete=models.PROTECT,
+        related_name="dialer_policies",
+    )
+    enabled = models.BooleanField(
+        default=False,
+        help_text="Enable only after the project flows, batches, and route IPs are configured.",
+    )
+
+    class Meta:
+        ordering = ["dialer__dialer_name"]
+        verbose_name_plural = "Dialer routing policies"
+
+    def __str__(self) -> str:
+        return f"{self.dialer.dialer_name} -> {self.project.name}"
+
+    def clean(self):
+        super().clean()
+        if not self.enabled or not self.project_id:
+            return
+
+        errors = self.get_configuration_errors()
+        if errors:
+            raise ValidationError({"enabled": " ".join(errors)})
+
+    def get_configuration_errors(self):
+        if not self.project_id:
+            return ["Select a routing project."]
+
+        if self.dialer_id and self.project.client_id != self.dialer.client_id:
+            return ["The routing project and dialer must belong to the same client."]
+
+        if not self.project.active:
+            return ["The selected routing project is inactive."]
+
+        if not (self.project.name or "").strip():
+            return ["The routing project must have a name."]
+
+        active_flows = list(
+            self.project.flows.filter(active=True).prefetch_related("batches")
+        )
+        if not active_flows:
+            return ["Add at least one active flow before enabling this policy."]
+
+        invalid_flows = [
+            flow.name or f"ID {flow.id}"
+            for flow in active_flows
+            if not (flow.name or "").strip() or flow.weight <= 0
+        ]
+        if invalid_flows:
+            return [
+                "Every active flow needs a name and positive weight. "
+                f"Invalid: {', '.join(invalid_flows)}."
+            ]
+
+        flows_without_batches = [
+            flow.name
+            for flow in active_flows
+            if not any(batch.active and batch.weight > 0 for batch in flow.batches.all())
+        ]
+        if flows_without_batches:
+            return [
+                "Every active flow needs an active batch before enabling. "
+                f"Missing: {', '.join(flows_without_batches)}."
+            ]
+
+        if not self.pk:
+            return [
+                "Save this policy disabled, add its route IPs, then enable it."
+            ]
+
+        valid_endpoint_exists = any(
+            endpoint.active
+            and endpoint.weight > 0
+            and (endpoint.route_ip or "").strip()
+            and not any(
+                separator in endpoint.route_ip for separator in (",", "\n", "\r")
+            )
+            for endpoint in self.endpoints.all()
+        )
+        if not valid_endpoint_exists:
+            return ["Add at least one active weighted route IP before enabling."]
+
+        return []
+
+
+class RoutingEndpoint(models.Model):
+    policy = models.ForeignKey(
+        DialerRoutingPolicy,
+        on_delete=models.CASCADE,
+        related_name="endpoints",
+    )
+    route_ip = models.CharField(max_length=255)
+    weight = models.PositiveIntegerField(
+        default=1,
+        validators=[MinValueValidator(1)],
+        help_text="Relative distribution weight. For example, use 60 and 40 for a 60/40 split.",
+    )
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["policy__dialer__dialer_name", "route_ip"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["policy", "route_ip"],
+                name="routing_endpoint_policy_ip_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.policy.dialer.dialer_name} / {self.route_ip}"
+
+    def clean(self):
+        super().clean()
+        self.route_ip = (self.route_ip or "").strip()
+        if not self.route_ip or any(separator in self.route_ip for separator in (",", "\n", "\r")):
+            raise ValidationError(
+                {"route_ip": "Enter one IP address or hostname per route row."}
+            )
 
 
 class CallLog(models.Model):

@@ -10,7 +10,6 @@ import struct
 import time
 import uuid
 from functools import lru_cache
-from pathlib import Path
 from urllib.parse import quote
 from django.views.decorators.csrf import csrf_exempt
 
@@ -20,7 +19,7 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core import signing
 from django.core.validators import URLValidator, validate_email
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Count, Sum
 from django.db.models.functions import TruncDay, TruncHour, TruncMinute, TruncMonth
 from django.http import JsonResponse
@@ -41,13 +40,14 @@ from .models import (
 from .api_token_cache import get_active_api_tokens, preload_active_api_tokens
 from .dashboard_cache import build_dashboard_cache_key, bump_dashboard_cache_version
 from .route_cache import get_dialer_route_map, preload_dialer_route_map
+from .routing import select_weighted_call_assignment, select_weighted_route
 from .rollups import (
     adjust_call_log_rollup,
     build_call_log_rollup_snapshot,
     increment_call_log_rollup,
 )
 
-AREA_CODES_CSV_PATH = Path("/home/kali/new1.2/assets/us_area_codes.csv")
+AREA_CODES_CSV_PATH = settings.AREA_CODES_CSV_PATH
 url_validator = URLValidator()
 PASSWORD_RESET_SALT = "chatbot-forgot-password-v1"
 TOTP_ISSUER = "Portal"
@@ -69,6 +69,23 @@ def _json_error(message, status=400):
 
 def _json_response(payload, status=200):
     return JsonResponse({"status_code": status, **payload}, status=status)
+
+
+@require_GET
+def health_view(request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+
+        health_cache_key = "application_health_check"
+        cache.set(health_cache_key, "ok", timeout=10)
+        if cache.get(health_cache_key) != "ok":
+            raise RuntimeError("Cache health check failed.")
+    except Exception:
+        return _json_response({"status": "unavailable"}, status=503)
+
+    return _json_response({"status": "ok"})
 
 
 def _generate_totp_secret():
@@ -372,6 +389,10 @@ def _validate_call_log_payload(payload, *, require_status=False):
 
 
 def _get_call_log_flow_and_batch(dialer_id):
+    weighted_assignment = select_weighted_call_assignment(dialer_id)
+    if weighted_assignment is not None:
+        return weighted_assignment
+
     with transaction.atomic():
         dialer = (
             Dialer.objects.select_for_update()
@@ -1028,17 +1049,25 @@ def request_route_view(request):
     if dialer_details is None:
         return _json_error("No dialer found for the provided dialer_name.", status=404)
 
-    route_ips = dialer_details["route_ips"]
-    if not route_ips:
-        return _json_error("No route IPs are configured for the provided dialer_name.", status=404)
-
-    selected_route_ip = random.choice(route_ips)
+    weighted_route = select_weighted_route(dialer_details["dialer_id"])
+    if weighted_route is not None:
+        selected_route_ip = weighted_route["route_ip"]
+        selected_project = weighted_route["project"]
+    else:
+        route_ips = dialer_details["route_ips"]
+        if not route_ips:
+            return _json_error(
+                "No route IPs are configured for the provided dialer_name.",
+                status=404,
+            )
+        selected_route_ip = random.choice(route_ips)
+        selected_project = dialer_details["project"]
 
     return _json_response(
         {
             "message": "Route IP fetched successfully.",
             "dialer_name": dialer_details["dialer_name"],
-            "project": dialer_details["project"],
+            "project": selected_project,
             "xferexten": dialer_details["xferexten"],
             "agent_api_url": dialer_details["agent_api_url"],
             "non_agent_api_url": dialer_details["non_agent_api_url"],
@@ -1076,12 +1105,22 @@ def check_batchnflow_view(request):
     if dialer_details is None:
         return _json_error("No dialer found for the provided dialer_name.", status=404)
 
+    weighted_assignment = select_weighted_call_assignment(dialer_details["dialer_id"])
+
     return _json_response(
         {
             "message": "Batch and flow fetched successfully.",
             "dialer_name": dialer_details["dialer_name"],
-            "batch": dialer_details["batch"],
-            "flow": dialer_details["flow"],
+            "batch": (
+                str(weighted_assignment["batch"])
+                if weighted_assignment is not None
+                else dialer_details["batch"]
+            ),
+            "flow": (
+                weighted_assignment["flow"]
+                if weighted_assignment is not None
+                else dialer_details["flow"]
+            ),
         }
     )
 

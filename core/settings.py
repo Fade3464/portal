@@ -94,13 +94,18 @@ REST_FRAMEWORK = {
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
 DB_ENGINE = os.getenv("DB_ENGINE", "django.db.backends.sqlite3")
-DB_NAME = os.getenv("DB_NAME", BASE_DIR / "db.sqlite3")
-DB_USER = os.getenv("DB_USER", "")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME") or os.getenv("POSTGRES_DB") or BASE_DIR / "db.sqlite3"
+DB_USER = os.getenv("DB_USER") or os.getenv("POSTGRES_USER", "")
+DB_PASSWORD = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = os.getenv("DB_PORT", "")
 DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "60"))
+DB_DISABLE_SERVER_SIDE_CURSORS = _get_bool_env(
+    "DB_DISABLE_SERVER_SIDE_CURSORS",
+    False,
+)
 CACHE_TIMEOUT = int(os.getenv("CACHE_TIMEOUT", "300"))
+ROUTING_POLICY_CACHE_TTL = int(os.getenv("ROUTING_POLICY_CACHE_TTL", "300"))
 CACHE_KEY_PREFIX = os.getenv("CACHE_KEY_PREFIX", "aims")
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "5000"))
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
@@ -118,6 +123,8 @@ DATABASES = {
         'HOST': DB_HOST,
         'PORT': DB_PORT,
         'CONN_MAX_AGE': DB_CONN_MAX_AGE,
+        'CONN_HEALTH_CHECKS': True,
+        'DISABLE_SERVER_SIDE_CURSORS': DB_DISABLE_SERVER_SIDE_CURSORS,
     }
 }
 
@@ -187,6 +194,9 @@ STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles" 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+AREA_CODES_CSV_PATH = Path(
+    os.getenv("AREA_CODES_CSV_PATH", str(BASE_DIR / "assets" / "us_area_codes.csv"))
+)
 CALL_RECORDINGS_BASE_URL = os.getenv("CALL_RECORDINGS_BASE_URL", "").strip().rstrip("/")
 CALL_RECORDINGS_FILE_EXTENSION = (
     os.getenv("CALL_RECORDINGS_FILE_EXTENSION", "wav").strip().lstrip(".") or "wav"

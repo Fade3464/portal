@@ -18,6 +18,7 @@ from .views import (
     forgot_password_reset_view,
     forgot_password_start_view,
     forgot_password_verify_view,
+    health_view,
     login_view,
     login_options_view,
     logout_view,
@@ -28,6 +29,7 @@ from .views import (
 
 
 urlpatterns = [
+    path("api/health/", health_view, name="health"),
     path("api/login/", login_view, name="login"),
     path("api/login/options/", login_options_view, name="login_options"),
     path("api/logout/", logout_view, name="logout"),

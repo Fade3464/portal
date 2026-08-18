@@ -10,11 +10,14 @@ __pycache__/
 
 # Environment file
 .env
+.env.production
 
 # Django
 db.sqlite3
+.django_cache/
 media/
 staticfiles/
+backups/
 
 # Frontend build output
 frontend/dist/

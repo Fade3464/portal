@@ -4,3 +4,6 @@ from django.apps import AppConfig
 class ChatbotConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "Chatbot"
+
+    def ready(self):
+        from . import routing_signals  # noqa: F401

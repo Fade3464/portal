@@ -1,0 +1,190 @@
+x-backend-common: &backend-common
+  image: aims-backend:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - ${ENV_FILE:-.env.production}
+  environment:
+    DB_ENGINE: django.db.backends.postgresql
+    DB_HOST: pgbouncer
+    DB_PORT: "6432"
+    DB_CONN_MAX_AGE: "0"
+    DB_DISABLE_SERVER_SIDE_CURSORS: "True"
+    REDIS_URL: redis://redis:6379/1
+  volumes:
+    - static_data:/app/staticfiles
+    - media_data:/app/media
+  networks:
+    - app_network
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+    shm_size: 256mb
+    networks:
+      - app_network
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    stop_grace_period: 30s
+    networks:
+      - app_network
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  pgbouncer:
+    image: aims-pgbouncer:local
+    build:
+      context: .
+      dockerfile: docker/pgbouncer/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE:-.env.production}
+    environment:
+      PGBOUNCER_DATABASE_HOST: db
+      PGBOUNCER_DATABASE_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready --quiet --host=127.0.0.1 --port=6432 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    networks:
+      - app_network
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  migrate:
+    <<: *backend-common
+    restart: "no"
+    command: ["/app/docker/backend/migrate.sh"]
+    environment:
+      DB_ENGINE: django.db.backends.postgresql
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_CONN_MAX_AGE: "0"
+      DB_DISABLE_SERVER_SIDE_CURSORS: "False"
+      REDIS_URL: redis://redis:6379/1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  backend:
+    <<: *backend-common
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail --silent --show-error -H 'Host: localhost' -H 'X-Forwarded-Proto: https' http://localhost:8000/api/health/ >/dev/null",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 45s
+
+  maintenance:
+    <<: *backend-common
+    restart: unless-stopped
+    command: ["/app/docker/backend/maintenance-loop.sh"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+  frontend:
+    image: aims-frontend:local
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:80"
+    volumes:
+      - static_data:/srv/static:ro
+      - media_data:/srv/media:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    stop_grace_period: 30s
+    networks:
+      - app_network
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_data:
+  media_data:
+
+networks:
+  app_network:
+    driver: bridge
