@@ -6,8 +6,8 @@ import SidebarLayout from "./components/layout/SidebarLayout";
 import ProtectedRoute from "./components/ProtectedRoute";
 import { SpinnerCustom } from "./components/ui/spinner";
 import { ThemeProvider } from "./context/ThemeProvider";
-import AuthPage from "./pages/AuthPage";
 import AccountPage from "./pages/AccountPage";
+import AuthPage from "./pages/AuthPage";
 import CallLookupPage from "./pages/CallLookupPage";
 import Dashboard from "./pages/Dashboard";
 
@@ -27,7 +27,7 @@ function PageTitle() {
     );
     const pageTitle = matchingPath ? PAGE_TITLES[matchingPath] : null;
 
-    document.title = pageTitle ? `${pageTitle} | Pulsar Portal` : "Pulsar Portal";
+    document.title = pageTitle ? `${pageTitle} | Pulsar` : "Pulsar";
   }, [location.pathname]);
 
   return null;
