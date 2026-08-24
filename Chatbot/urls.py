@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     account_password_view,
     account_password_verify_view,
+    account_authenticator_device_view,
     account_authenticator_setup_view,
     account_authenticator_verify_view,
     account_profile_view,
@@ -45,6 +46,11 @@ urlpatterns = [
         "api/account/recovery-authenticator/verify/",
         account_authenticator_verify_view,
         name="account_authenticator_verify",
+    ),
+    path(
+        "api/account/recovery-authenticator/devices/<int:device_id>/",
+        account_authenticator_device_view,
+        name="account_authenticator_device",
     ),
     path(
         "api/account/password/verify/",

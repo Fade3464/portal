@@ -14,6 +14,7 @@ from django.urls import reverse
 from .api_token_cache import preload_active_api_tokens
 from .models import (
     Client,
+    ClientTOTPDevice,
     Dialer,
     DialerRoutingPolicy,
     RESTAPITOKENS,
@@ -182,6 +183,7 @@ class AuthenticationFlowTests(TestCase):
     replacement_password = "Replacement-S3cure-Passphrase!"
     fixed_time = 1_800_000_000
     totp_secret = "JBSWY3DPEHPK3PXP"
+    second_totp_secret = "KRUGS4ZANFZSAYJA"
 
     def setUp(self):
         cache.clear()
@@ -397,6 +399,134 @@ class AuthenticationFlowTests(TestCase):
         self.assertEqual(missing_password_response.status_code, 400)
         self.assertEqual(valid_response.status_code, 200)
         self.assertIn("otpauth_url", valid_response.json())
+
+    def test_each_registered_authenticator_can_complete_login(self):
+        first_device = ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Operations phone",
+            secret=self.totp_secret,
+            enabled=True,
+        )
+        second_device = ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Supervisor phone",
+            secret=self.second_totp_secret,
+            enabled=True,
+        )
+        second_client = self.client_class()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            self._start_mfa_login()
+            first_response = self.client.post(
+                reverse("login"),
+                data={"otp": _generate_totp_code(first_device.secret, self.fixed_time // 30)},
+                content_type="application/json",
+            )
+            self._start_mfa_login(second_client)
+            second_response = second_client.post(
+                reverse("login"),
+                data={"otp": _generate_totp_code(second_device.secret, self.fixed_time // 30)},
+                content_type="application/json",
+            )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        first_device.refresh_from_db()
+        second_device.refresh_from_db()
+        self.assertIsNotNone(first_device.last_used_at)
+        self.assertIsNotNone(second_device.last_used_at)
+
+    def test_can_add_a_second_named_authenticator(self):
+        ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Primary authenticator",
+            secret=self.totp_secret,
+            enabled=True,
+        )
+        self.client.force_login(self.user)
+
+        setup_response = self.client.post(
+            reverse("account_authenticator_setup"),
+            data={
+                "name": "Backup phone",
+                "current_password": self.password,
+            },
+            content_type="application/json",
+        )
+        setup_data = setup_response.json()
+        setup_device = ClientTOTPDevice.objects.get(pk=setup_data["device_id"])
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            verify_response = self.client.post(
+                reverse("account_authenticator_verify"),
+                data={
+                    "device_id": setup_device.id,
+                    "otp": _generate_totp_code(setup_device.secret, self.fixed_time // 30),
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(setup_response.status_code, 200)
+        self.assertEqual(verify_response.status_code, 200)
+        setup_device.refresh_from_db()
+        self.assertTrue(setup_device.enabled)
+        self.assertEqual(
+            [device["name"] for device in verify_response.json()["profile"]["authenticator_devices"]],
+            ["Primary authenticator", "Backup phone"],
+        )
+
+    def test_account_profile_lists_devices_without_secrets(self):
+        ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Operations phone",
+            secret=self.totp_secret,
+            enabled=True,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("account_profile"))
+        device_payload = response.json()["profile"]["authenticator_devices"][0]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(device_payload["name"], "Operations phone")
+        self.assertNotIn("secret", device_payload)
+
+    def test_removing_authenticator_requires_password_and_preserves_remaining_device(self):
+        first_device = ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Operations phone",
+            secret=self.totp_secret,
+            enabled=True,
+        )
+        second_device = ClientTOTPDevice.objects.create(
+            client=self.client_profile,
+            name="Supervisor phone",
+            secret=self.second_totp_secret,
+            enabled=True,
+        )
+        self.client.force_login(self.user)
+        remove_url = reverse(
+            "account_authenticator_device",
+            kwargs={"device_id": first_device.id},
+        )
+
+        rejected_response = self.client.delete(
+            remove_url,
+            data={"current_password": "wrong-password"},
+            content_type="application/json",
+        )
+        removed_response = self.client.delete(
+            remove_url,
+            data={"current_password": self.password},
+            content_type="application/json",
+        )
+
+        self.assertEqual(rejected_response.status_code, 400)
+        self.assertEqual(removed_response.status_code, 200)
+        self.assertFalse(ClientTOTPDevice.objects.filter(pk=first_device.pk).exists())
+        self.assertTrue(ClientTOTPDevice.objects.filter(pk=second_device.pk).exists())
+        self.client_profile.refresh_from_db()
+        self.assertEqual(self.client_profile.recovery_totp_secret, second_device.secret)
 
 
 class WeightedRoutingTests(TestCase):

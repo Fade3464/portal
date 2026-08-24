@@ -4,6 +4,7 @@ from .models import (
     BlacklistedNumbers,
     CallLog,
     Client,
+    ClientTOTPDevice,
     Dialer,
     DialerRoutingPolicy,
     RESTAPITOKENS,
@@ -14,10 +15,27 @@ from .models import (
 )
 
 
+class ClientTOTPDeviceInline(admin.TabularInline):
+    model = ClientTOTPDevice
+    extra = 0
+    fields = ("name", "enabled", "created_at", "last_used_at")
+    readonly_fields = ("created_at", "last_used_at")
+
+
 @admin.register(Client)
 class ClientAdmin(admin.ModelAdmin):
     list_display = ("client_name", "user", "email")
     search_fields = ("client_name", "user__username", "user__email")
+    inlines = (ClientTOTPDeviceInline,)
+
+
+@admin.register(ClientTOTPDevice)
+class ClientTOTPDeviceAdmin(admin.ModelAdmin):
+    list_display = ("name", "client", "enabled", "created_at", "last_used_at")
+    list_filter = ("enabled", "created_at")
+    search_fields = ("name", "client__client_name", "client__user__email")
+    exclude = ("secret",)
+    readonly_fields = ("created_at", "last_used_at")
 
 
 @admin.register(Dialer)

@@ -27,6 +27,31 @@ class Client(models.Model):
         return self.user.email
 
 
+class ClientTOTPDevice(models.Model):
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="authenticator_devices",
+    )
+    name = models.CharField(max_length=100)
+    secret = models.CharField(max_length=64)
+    enabled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                name="client_totp_device_name_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.client.client_name} / {self.name}"
+
+
 class Dialer(models.Model):
     dialer_name = models.CharField(max_length=255, db_index=True)
     client = models.ForeignKey(

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, Fingerprint, Mail, Palette, ShieldCheck, Smartphone, UserRound } from "lucide-react";
+import { ArrowRight, CheckCircle2, Fingerprint, Mail, Palette, Plus, ShieldCheck, Smartphone, Trash2, UserRound } from "lucide-react";
 import QRCode from "qrcode";
 import { toast } from "sonner";
 
@@ -28,6 +28,13 @@ import {
 import { getCsrfToken } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 
+type AuthenticatorDevice = {
+  id: number;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+};
+
 type AccountProfile = {
   first_name: string;
   last_name: string;
@@ -36,6 +43,7 @@ type AccountProfile = {
   email: string;
   client_name: string;
   recovery_authenticator_enabled: boolean;
+  authenticator_devices: AuthenticatorDevice[];
 };
 
 type AccountResponse = {
@@ -54,9 +62,15 @@ type PasswordResponse = {
 type AuthenticatorSetupResponse = {
   status_code: number;
   message?: string;
+  device_id?: number;
+  device_name?: string;
   setup_key?: string;
   otpauth_url?: string;
   error?: string;
+};
+
+type AuthenticatorMutationResponse = PasswordResponse & {
+  profile?: AccountProfile;
 };
 
 const emptyProfile: AccountProfile = {
@@ -67,7 +81,15 @@ const emptyProfile: AccountProfile = {
   email: "",
   client_name: "",
   recovery_authenticator_enabled: false,
+  authenticator_devices: [],
 };
+
+function normalizeAccountProfile(profile: AccountProfile): AccountProfile {
+  return {
+    ...profile,
+    authenticator_devices: profile.authenticator_devices || [],
+  };
+}
 
 function getPasswordStrengthLabel(password: string) {
   if (!password) {
@@ -127,9 +149,14 @@ export default function AccountPage() {
   const [authenticatorOtpAuthUrl, setAuthenticatorOtpAuthUrl] = useState("");
   const [authenticatorQrCodeDataUrl, setAuthenticatorQrCodeDataUrl] = useState("");
   const [authenticatorOtp, setAuthenticatorOtp] = useState("");
+  const [authenticatorDeviceId, setAuthenticatorDeviceId] = useState<number | null>(null);
+  const [authenticatorDeviceName, setAuthenticatorDeviceName] = useState("");
   const [authenticatorCurrentPassword, setAuthenticatorCurrentPassword] = useState("");
   const [startingAuthenticatorSetup, setStartingAuthenticatorSetup] = useState(false);
   const [verifyingAuthenticator, setVerifyingAuthenticator] = useState(false);
+  const [deviceToRemove, setDeviceToRemove] = useState<AuthenticatorDevice | null>(null);
+  const [removeAuthenticatorPassword, setRemoveAuthenticatorPassword] = useState("");
+  const [removingAuthenticator, setRemovingAuthenticator] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -149,7 +176,7 @@ export default function AccountPage() {
           throw new Error(data.error || "Failed to load account details.");
         }
 
-        setProfile(data.profile);
+        setProfile(normalizeAccountProfile(data.profile));
         setForm({
           first_name: data.profile.first_name,
           last_name: data.profile.last_name,
@@ -251,7 +278,7 @@ export default function AccountPage() {
         throw new Error(data.error || "Failed to update account details.");
       }
 
-      setProfile(data.profile);
+      setProfile(normalizeAccountProfile(data.profile));
       setForm({
         first_name: data.profile.first_name,
         last_name: data.profile.last_name,
@@ -367,6 +394,11 @@ export default function AccountPage() {
   };
 
   const handleStartAuthenticatorSetup = async () => {
+    if (!authenticatorDeviceName.trim()) {
+      toast.error("Enter a name for this authenticator.");
+      return;
+    }
+
     if (!authenticatorCurrentPassword) {
       toast.error("Enter your current password to continue.");
       return;
@@ -383,6 +415,7 @@ export default function AccountPage() {
         },
         credentials: "include",
         body: JSON.stringify({
+          name: authenticatorDeviceName.trim(),
           current_password: authenticatorCurrentPassword,
         }),
       });
@@ -393,6 +426,7 @@ export default function AccountPage() {
       }
 
       setAuthenticatorOtpAuthUrl(data.otpauth_url || "");
+      setAuthenticatorDeviceId(data.device_id || null);
       setAuthenticatorOtp("");
       setAuthenticatorCurrentPassword("");
       toast.success(data.message || "Authenticator setup started.");
@@ -417,29 +451,78 @@ export default function AccountPage() {
         },
         credentials: "include",
         body: JSON.stringify({
+          device_id: authenticatorDeviceId,
           otp: authenticatorOtp,
         }),
       });
-      const data: PasswordResponse = await res.json();
+      const data: AuthenticatorMutationResponse = await res.json();
 
       if (!res.ok) {
         throw new Error(data.error || "Failed to verify authenticator.");
       }
 
-      setProfile((current) => ({
-        ...current,
-        recovery_authenticator_enabled: true,
-      }));
+      if (data.profile) {
+        setProfile(normalizeAccountProfile(data.profile));
+      }
       setAuthenticatorOtpAuthUrl("");
       setAuthenticatorQrCodeDataUrl("");
       setAuthenticatorOtp("");
-      toast.success(data.message || "Multi-factor authentication enabled.");
+      setAuthenticatorDeviceId(null);
+      setAuthenticatorDeviceName("");
+      toast.success(data.message || "Authenticator added.");
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to verify authenticator."
       );
     } finally {
       setVerifyingAuthenticator(false);
+    }
+  };
+
+  const handleCancelAuthenticatorSetup = () => {
+    setAuthenticatorOtpAuthUrl("");
+    setAuthenticatorQrCodeDataUrl("");
+    setAuthenticatorOtp("");
+    setAuthenticatorDeviceId(null);
+  };
+
+  const handleRemoveAuthenticator = async () => {
+    if (!deviceToRemove || !removeAuthenticatorPassword) {
+      return;
+    }
+
+    try {
+      setRemovingAuthenticator(true);
+      const res = await fetch(
+        `/api/account/recovery-authenticator/devices/${deviceToRemove.id}/`,
+        {
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": getCsrfToken(),
+          },
+          credentials: "include",
+          body: JSON.stringify({ current_password: removeAuthenticatorPassword }),
+        }
+      );
+      const data: AuthenticatorMutationResponse = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to remove authenticator.");
+      }
+
+      if (data.profile) {
+        setProfile(normalizeAccountProfile(data.profile));
+      }
+      setDeviceToRemove(null);
+      setRemoveAuthenticatorPassword("");
+      toast.success(data.message || "Authenticator removed.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to remove authenticator."
+      );
+    } finally {
+      setRemovingAuthenticator(false);
     }
   };
 
@@ -743,36 +826,72 @@ export default function AccountPage() {
 
         <Card className="rounded-3xl border-border/45 bg-card/92 dark:border-white/8">
           <CardHeader className="pb-4">
-            <div className="flex items-center gap-3">
-              <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                <Smartphone className="h-5 w-5" />
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                  <Smartphone className="h-5 w-5" />
+                </div>
+                <div>
+                  <CardTitle className="text-xl">Multi-factor Authentication</CardTitle>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Add a separate authenticator for each authorized person or device.
+                  </p>
+                </div>
               </div>
-              <CardTitle className="text-xl">Multi-factor Authentication</CardTitle>
+              <span className="shrink-0 text-sm text-muted-foreground">
+                {profile.authenticator_devices.length}/10
+              </span>
             </div>
           </CardHeader>
           <CardContent className="space-y-5">
-            {profile.recovery_authenticator_enabled ? (
-              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.08] px-5 py-5 shadow-sm">
-                <div className="flex items-center gap-4">
-                  <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
-                    <Smartphone className="h-5 w-5" />
-                  </div>
-                  <div className="space-y-3">
-                    <p className="text-2xl font-semibold tracking-tight text-foreground">
-                      Authenticator Protection
-                    </p>
-                    <div className="inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">
-                      Enabled
+            {profile.authenticator_devices.length > 0 ? (
+              <div className="divide-y divide-border rounded-xl border border-border/70 dark:border-white/10">
+                {profile.authenticator_devices.map((device) => (
+                  <div
+                    key={device.id}
+                    className="flex items-center justify-between gap-4 px-4 py-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{device.name}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {device.last_used_at
+                          ? `Last used ${new Date(device.last_used_at).toLocaleString()}`
+                          : `Added ${new Date(device.created_at).toLocaleDateString()}`}
+                      </p>
                     </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setDeviceToRemove(device)}
+                      aria-label={`Remove ${device.name}`}
+                      title={`Remove ${device.name}`}
+                      className="shrink-0 text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
                   </div>
-                </div>
+                ))}
               </div>
             ) : (
-              <>
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  Require your password and a rotating authenticator code when signing in.
-                </p>
+              <p className="rounded-xl border border-dashed border-border px-4 py-5 text-center text-sm text-muted-foreground">
+                No authenticator devices are registered yet.
+              </p>
+            )}
 
+            {!authenticatorOtpAuthUrl ? (
+              <div className="grid gap-4 border-t border-border/60 pt-5 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="authenticator-device-name">Device name</Label>
+                  <Input
+                    id="authenticator-device-name"
+                    value={authenticatorDeviceName}
+                    onChange={(event) => setAuthenticatorDeviceName(event.target.value)}
+                    placeholder="e.g. Operations phone"
+                    maxLength={100}
+                    disabled={startingAuthenticatorSetup}
+                  />
+                </div>
                 <div className="space-y-2">
                   <Label htmlFor="authenticator-current-password">Current Password</Label>
                   <PasswordInput
@@ -781,31 +900,27 @@ export default function AccountPage() {
                     onChange={(event) => setAuthenticatorCurrentPassword(event.target.value)}
                     placeholder="Confirm your password"
                     autoComplete="current-password"
-                    disabled={startingAuthenticatorSetup || Boolean(authenticatorOtpAuthUrl)}
+                    disabled={startingAuthenticatorSetup}
                   />
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">
-                    Not enabled
-                  </div>
-
+                <div className="flex justify-end sm:col-span-2">
                   <Button
                     type="button"
-                    variant="outline"
                     onClick={() => void handleStartAuthenticatorSetup()}
                     disabled={
                       startingAuthenticatorSetup ||
+                      !authenticatorDeviceName.trim() ||
                       !authenticatorCurrentPassword ||
-                      Boolean(authenticatorOtpAuthUrl)
+                      profile.authenticator_devices.length >= 10
                     }
-                    className="dark:border-white/10"
                   >
-                    {startingAuthenticatorSetup ? "Preparing..." : "Set Up MFA"}
+                    <Plus className="h-4 w-4" />
+                    {startingAuthenticatorSetup ? "Preparing..." : "Add authenticator"}
                   </Button>
                 </div>
-
-                {authenticatorOtpAuthUrl ? (
+              </div>
+            ) : (
               <div className="space-y-4 rounded-2xl border border-border/70 bg-background/60 p-4 dark:border-white/10">
                 <div className="flex justify-center">
                   <div className="rounded-2xl border border-border/70 bg-white p-4 shadow-sm dark:border-white/10">
@@ -823,23 +938,10 @@ export default function AccountPage() {
                   </div>
                 </div>
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Method
-                    </p>
-                    <p className="mt-2 font-medium">Google Authenticator</p>
-                  </div>
-                  <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3 dark:border-white/10">
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Code
-                    </p>
-                    <p className="mt-2 font-medium">6 digits</p>
-                  </div>
-                </div>
-
                 <div className="space-y-2">
-                  <Label htmlFor="authenticator-otp">Authenticator Code</Label>
+                  <Label htmlFor="authenticator-otp">
+                    Enter the 6-digit code to finish setup
+                  </Label>
                   <InputOTP
                     id="authenticator-otp"
                     maxLength={6}
@@ -858,22 +960,75 @@ export default function AccountPage() {
                   </InputOTP>
                 </div>
 
-                <div className="flex justify-end">
+                <div className="flex justify-between gap-3">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleCancelAuthenticatorSetup}
+                    disabled={verifyingAuthenticator}
+                  >
+                    Cancel
+                  </Button>
                   <Button
                     type="button"
                     onClick={() => void handleVerifyAuthenticator()}
                     disabled={verifyingAuthenticator || authenticatorOtp.trim().length !== 6}
                   >
-                    {verifyingAuthenticator ? "Verifying..." : "Verify & Enable"}
+                    {verifyingAuthenticator ? "Verifying..." : "Verify and add"}
                   </Button>
                 </div>
               </div>
-                ) : null}
-              </>
             )}
           </CardContent>
         </Card>
       </div>
+
+      <Dialog
+        open={Boolean(deviceToRemove)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDeviceToRemove(null);
+            setRemoveAuthenticatorPassword("");
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove authenticator</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Confirm your password to remove {deviceToRemove?.name}.
+          </p>
+          <div className="space-y-2">
+            <Label htmlFor="remove-authenticator-password">Current password</Label>
+            <PasswordInput
+              id="remove-authenticator-password"
+              value={removeAuthenticatorPassword}
+              onChange={(event) => setRemoveAuthenticatorPassword(event.target.value)}
+              autoComplete="current-password"
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeviceToRemove(null)}
+              disabled={removingAuthenticator}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => void handleRemoveAuthenticator()}
+              disabled={removingAuthenticator || !removeAuthenticatorPassword}
+            >
+              {removingAuthenticator ? "Removing..." : "Remove"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={saveModalOpen} onOpenChange={setSaveModalOpen}>
         <DialogContent className="sm:max-w-md">

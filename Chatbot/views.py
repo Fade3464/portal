@@ -27,7 +27,7 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core import signing
 from django.core.validators import URLValidator, validate_email
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Count, Sum
 from django.db.models.functions import TruncDay, TruncHour, TruncMinute, TruncMonth
 from django.http import JsonResponse
@@ -41,6 +41,8 @@ from .models import (
     BlacklistedNumbers,
     CallLog,
     CallLogMinuteRollup,
+    Client,
+    ClientTOTPDevice,
     Dialer,
     LoginRateLimit,
     RESTAPITOKENS,
@@ -66,6 +68,7 @@ ACCOUNT_AUTH_RATE_LIMIT_SECONDS = 900
 MFA_CHALLENGE_TTL_SECONDS = 300
 PASSWORD_RESET_TTL_SECONDS = 600
 MFA_SESSION_KEY = "pending_mfa_authentication"
+MAX_TOTP_DEVICES_PER_CLIENT = 10
 DASHBOARD_TABLE_CACHE_TTL_SECONDS = 30
 DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 120
 LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 5
@@ -155,8 +158,61 @@ def _consume_totp_code(user_id, secret, otp, *, scope="authentication"):
     if matched_counter is None:
         return False
 
-    replay_key = f"totp-used:{scope}:{user_id}:{matched_counter}"
+    secret_fingerprint = _auth_subject_digest(secret)[:16]
+    replay_key = (
+        f"totp-used:{scope}:{user_id}:{secret_fingerprint}:{matched_counter}"
+    )
     return cache.add(replay_key, True, timeout=180)
+
+
+def _get_enabled_totp_devices(client):
+    if client is None:
+        return []
+    return list(client.authenticator_devices.filter(enabled=True).only("id", "secret"))
+
+
+def _consume_client_totp_code(client, otp, *, scope="authentication"):
+    if client is None:
+        return False
+
+    devices = _get_enabled_totp_devices(client)
+    for device in devices:
+        if _consume_totp_code(client.user_id, device.secret, otp, scope=scope):
+            ClientTOTPDevice.objects.filter(pk=device.pk).update(last_used_at=timezone.now())
+            return True
+
+    if devices:
+        return False
+
+    return bool(
+        client.recovery_totp_enabled
+        and client.recovery_totp_secret
+        and _consume_totp_code(
+            client.user_id,
+            client.recovery_totp_secret,
+            otp,
+            scope=scope,
+        )
+    )
+
+
+def _sync_legacy_totp_fields(client):
+    primary_device = (
+        client.authenticator_devices.filter(enabled=True)
+        .only("secret")
+        .order_by("created_at", "id")
+        .first()
+    )
+    secret = primary_device.secret if primary_device else ""
+    enabled = primary_device is not None
+
+    if (
+        client.recovery_totp_secret != secret
+        or client.recovery_totp_enabled != enabled
+    ):
+        client.recovery_totp_secret = secret
+        client.recovery_totp_enabled = enabled
+        client.save(update_fields=["recovery_totp_secret", "recovery_totp_enabled"])
 
 
 def _auth_subject_digest(value):
@@ -659,12 +715,27 @@ def _serialize_account_profile(client):
         "username": user.get_username(),
         "email": user.email,
         "client_name": client.client_name,
-        "recovery_authenticator_enabled": client.recovery_totp_enabled,
+        "recovery_authenticator_enabled": _is_recovery_authenticator_enabled(client),
+        "authenticator_devices": [
+            {
+                "id": device.id,
+                "name": device.name,
+                "created_at": device.created_at.isoformat(),
+                "last_used_at": (
+                    device.last_used_at.isoformat() if device.last_used_at else None
+                ),
+            }
+            for device in client.authenticator_devices.filter(enabled=True)
+        ],
     }
 
 
 def _is_recovery_authenticator_enabled(client):
-    return bool(client and client.recovery_totp_enabled and client.recovery_totp_secret)
+    if client is None:
+        return False
+    if client.authenticator_devices.filter(enabled=True).exists():
+        return True
+    return bool(client.recovery_totp_enabled and client.recovery_totp_secret)
 
 
 def _normalize_email(value, field_name, *, required=False):
@@ -763,7 +834,7 @@ def login_view(request):
         mfa_valid = bool(
             user_record
             and _is_recovery_authenticator_enabled(client)
-            and _consume_totp_code(user_record.pk, client.recovery_totp_secret, otp)
+            and _consume_client_totp_code(client, otp)
         )
 
         if not mfa_valid:
@@ -954,9 +1025,6 @@ def account_authenticator_setup_view(request):
     except ValueError as exc:
         return _json_error(str(exc))
 
-    if client.recovery_totp_enabled and client.recovery_totp_secret:
-        return _json_error("Multi-factor authentication is already enabled.", status=400)
-
     current_password = payload.get("current_password") or ""
     account_subject = client.user.email or str(client.user_id)
     if _is_auth_subject_locked("mfa-setup", account_subject):
@@ -968,17 +1036,59 @@ def account_authenticator_setup_view(request):
 
     _clear_auth_subject_failures("mfa-setup", account_subject)
 
+    try:
+        device_name = _normalize_optional_string(
+            payload.get("name"),
+            "name",
+            100,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
     secret = _generate_totp_secret()
-    client.recovery_totp_secret = secret
-    client.recovery_totp_enabled = False
-    client.save(update_fields=["recovery_totp_secret", "recovery_totp_enabled"])
+    try:
+        with transaction.atomic():
+            locked_client = Client.objects.select_for_update().get(pk=client.pk)
+            enabled_count = locked_client.authenticator_devices.filter(enabled=True).count()
+            if not device_name:
+                device_name = f"Authenticator {enabled_count + 1}"
+
+            if locked_client.authenticator_devices.filter(
+                name__iexact=device_name,
+                enabled=True,
+            ).exists():
+                return _json_error(
+                    "An authenticator with this name already exists.",
+                    status=409,
+                )
+
+            if enabled_count >= MAX_TOTP_DEVICES_PER_CLIENT:
+                return _json_error(
+                    f"A maximum of {MAX_TOTP_DEVICES_PER_CLIENT} authenticators is allowed.",
+                    status=400,
+                )
+
+            # Keep setup state unambiguous and discard abandoned, unverified secrets.
+            locked_client.authenticator_devices.filter(enabled=False).delete()
+            device = ClientTOTPDevice.objects.create(
+                client=locked_client,
+                name=device_name,
+                secret=secret,
+            )
+    except IntegrityError:
+        return _json_error("An authenticator with this name already exists.", status=409)
 
     account_name = client.user.email or client.user.get_username()
     return _json_response(
         {
             "message": "Multi-factor authentication setup started.",
+            "device_id": device.id,
+            "device_name": device.name,
             "setup_key": secret,
-            "otpauth_url": _build_totp_uri(secret, account_name),
+            "otpauth_url": _build_totp_uri(
+                secret,
+                f"{account_name} ({device.name})",
+            ),
         }
     )
 
@@ -995,7 +1105,16 @@ def account_authenticator_verify_view(request):
         return _json_error(str(exc))
 
     otp = payload.get("otp") or ""
-    if not client.recovery_totp_secret:
+    try:
+        device_id = _normalize_int(payload.get("device_id"), "device_id", minimum=1)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    pending_devices = client.authenticator_devices.filter(enabled=False)
+    if device_id is not None:
+        pending_devices = pending_devices.filter(pk=device_id)
+    device = pending_devices.order_by("-created_at", "-id").first()
+    if device is None:
         return _json_error("Authenticator setup has not been started.", status=400)
 
     account_subject = client.user.email or str(client.user_id)
@@ -1004,18 +1123,54 @@ def account_authenticator_verify_view(request):
 
     if not _consume_totp_code(
         client.user_id,
-        client.recovery_totp_secret,
+        device.secret,
         otp,
-        scope="setup",
+        scope=f"setup-{device.id}",
     ):
         _record_auth_subject_failure("mfa-setup", account_subject)
         return _json_error("Invalid authenticator code.", status=400)
 
-    client.recovery_totp_enabled = True
-    client.save(update_fields=["recovery_totp_enabled"])
+    device.enabled = True
+    device.last_used_at = timezone.now()
+    device.save(update_fields=["enabled", "last_used_at"])
+    _sync_legacy_totp_fields(client)
     _clear_auth_subject_failures("mfa-setup", account_subject)
 
-    return _json_response({"message": "Multi-factor authentication enabled successfully."})
+    return _json_response(
+        {
+            "message": "Authenticator added successfully.",
+            "profile": _serialize_account_profile(client),
+        }
+    )
+
+
+@require_http_methods(["DELETE"])
+def account_authenticator_device_view(request, device_id):
+    client, error_response = _get_authenticated_client(request)
+    if error_response:
+        return error_response
+
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    current_password = payload.get("current_password") or ""
+    if not current_password or not client.user.check_password(current_password):
+        return _json_error("Current password is incorrect.", status=400)
+
+    device = client.authenticator_devices.filter(pk=device_id, enabled=True).first()
+    if device is None:
+        return _json_error("Authenticator not found.", status=404)
+
+    device.delete()
+    _sync_legacy_totp_fields(client)
+    return _json_response(
+        {
+            "message": "Authenticator removed.",
+            "profile": _serialize_account_profile(client),
+        }
+    )
 
 
 @require_POST
@@ -1110,11 +1265,7 @@ def forgot_password_verify_view(request):
     recovery_valid = bool(
         client
         and _is_recovery_authenticator_enabled(client)
-        and _consume_totp_code(
-            client.user_id,
-            client.recovery_totp_secret,
-            otp,
-        )
+        and _consume_client_totp_code(client, otp)
     )
     if not recovery_valid:
         _record_auth_subject_failure("recovery", email)
@@ -1168,7 +1319,7 @@ def forgot_password_reset_view(request):
         return _json_error("Invalid or expired reset token.", status=400)
 
     client = getattr(user, "client_profile", None)
-    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+    if client is None or not _is_recovery_authenticator_enabled(client):
         return _json_error("Recovery authenticator is not configured for this account.", status=400)
 
     if user.check_password(new_password):
