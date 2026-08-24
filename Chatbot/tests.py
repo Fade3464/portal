@@ -28,6 +28,7 @@ from .routing import (
     select_weighted_call_assignment,
     select_weighted_route,
 )
+from .views import MFA_SESSION_KEY, _generate_totp_code
 
 
 class BootstrapSuperuserCommandTests(TestCase):
@@ -174,6 +175,228 @@ class HealthViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status_code": 200, "status": "ok"})
+
+
+class AuthenticationFlowTests(TestCase):
+    password = "Current-S3cure-Passphrase!"
+    replacement_password = "Replacement-S3cure-Passphrase!"
+    fixed_time = 1_800_000_000
+    totp_secret = "JBSWY3DPEHPK3PXP"
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="portal-user",
+            email="user@example.com",
+            password=self.password,
+        )
+        self.client_profile = Client.objects.create(
+            user=self.user,
+            client_name="Portal Client",
+        )
+
+    def _totp_code(self):
+        return _generate_totp_code(self.totp_secret, self.fixed_time // 30)
+
+    def _enable_mfa(self):
+        self.client_profile.recovery_totp_secret = self.totp_secret
+        self.client_profile.recovery_totp_enabled = True
+        self.client_profile.save(
+            update_fields=["recovery_totp_secret", "recovery_totp_enabled"]
+        )
+
+    def _start_mfa_login(self, client=None):
+        test_client = client or self.client
+        return test_client.post(
+            reverse("login"),
+            data={"email": self.user.email, "password": self.password},
+            content_type="application/json",
+        )
+
+    def test_login_options_does_not_disclose_account_state(self):
+        existing_response = self.client.post(
+            reverse("login_options"),
+            data={"email": self.user.email},
+            content_type="application/json",
+        )
+        missing_response = self.client.post(
+            reverse("login_options"),
+            data={"email": "missing@example.com"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(existing_response.status_code, 200)
+        self.assertEqual(missing_response.status_code, 200)
+        self.assertEqual(existing_response.json(), missing_response.json())
+        self.assertFalse(existing_response.json()["authenticator_enabled"])
+
+    def test_password_login_still_works_without_mfa(self):
+        response = self._start_mfa_login()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["mfa_required"])
+        self.assertEqual(response.json()["login_method"], "password")
+        self.assertEqual(int(self.client.session["_auth_user_id"]), self.user.pk)
+
+    def test_repeated_password_failures_are_throttled(self):
+        for _ in range(5):
+            response = self.client.post(
+                reverse("login"),
+                data={"email": self.user.email, "password": "incorrect-password"},
+                content_type="application/json",
+            )
+            self.assertEqual(response.status_code, 401)
+
+        locked_response = self.client.post(
+            reverse("login"),
+            data={"email": self.user.email, "password": self.password},
+            content_type="application/json",
+        )
+
+        self.assertEqual(locked_response.status_code, 429)
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_mfa_user_is_not_authenticated_after_password_only(self):
+        self._enable_mfa()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            response = self._start_mfa_login()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["mfa_required"])
+        self.assertNotIn("_auth_user_id", self.client.session)
+        self.assertEqual(
+            self.client.session[MFA_SESSION_KEY]["user_id"],
+            self.user.pk,
+        )
+
+    def test_otp_cannot_be_used_without_a_password_challenge(self):
+        self._enable_mfa()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            response = self.client.post(
+                reverse("login"),
+                data={"otp": self._totp_code()},
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_password_then_mfa_authenticates_and_rejects_otp_replay(self):
+        self._enable_mfa()
+        second_client = self.client_class()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            challenge_response = self._start_mfa_login()
+            login_response = self.client.post(
+                reverse("login"),
+                data={"otp": self._totp_code()},
+                content_type="application/json",
+            )
+            second_challenge_response = self._start_mfa_login(second_client)
+            replay_response = second_client.post(
+                reverse("login"),
+                data={"otp": self._totp_code()},
+                content_type="application/json",
+            )
+
+        self.assertTrue(challenge_response.json()["mfa_required"])
+        self.assertEqual(login_response.status_code, 200)
+        self.assertEqual(login_response.json()["login_method"], "password_mfa")
+        self.assertEqual(int(self.client.session["_auth_user_id"]), self.user.pk)
+        self.assertTrue(second_challenge_response.json()["mfa_required"])
+        self.assertEqual(replay_response.status_code, 401)
+        self.assertNotIn("_auth_user_id", second_client.session)
+
+    def test_expired_mfa_challenge_is_rejected(self):
+        self._enable_mfa()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            self._start_mfa_login()
+
+        session = self.client.session
+        session[MFA_SESSION_KEY]["expires_at"] = self.fixed_time - 1
+        session.save()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            response = self.client.post(
+                reverse("login"),
+                data={"otp": self._totp_code()},
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_recovery_start_is_generic_for_existing_and_missing_accounts(self):
+        self._enable_mfa()
+
+        existing_response = self.client.post(
+            reverse("forgot_password_start"),
+            data={"email": self.user.email},
+            content_type="application/json",
+        )
+        missing_response = self.client.post(
+            reverse("forgot_password_start"),
+            data={"email": "missing@example.com"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(existing_response.status_code, 200)
+        self.assertEqual(missing_response.status_code, 200)
+        self.assertEqual(existing_response.json(), missing_response.json())
+
+    def test_recovery_token_is_single_use(self):
+        self._enable_mfa()
+
+        with patch("Chatbot.views.time.time", return_value=self.fixed_time):
+            verify_response = self.client.post(
+                reverse("forgot_password_verify"),
+                data={"email": self.user.email, "otp": self._totp_code()},
+                content_type="application/json",
+            )
+
+        reset_token = verify_response.json()["reset_token"]
+        reset_payload = {
+            "reset_token": reset_token,
+            "new_password": self.replacement_password,
+            "confirm_password": self.replacement_password,
+        }
+        reset_response = self.client.post(
+            reverse("forgot_password_reset"),
+            data=reset_payload,
+            content_type="application/json",
+        )
+        replay_response = self.client.post(
+            reverse("forgot_password_reset"),
+            data=reset_payload,
+            content_type="application/json",
+        )
+
+        self.assertEqual(verify_response.status_code, 200)
+        self.assertEqual(reset_response.status_code, 200)
+        self.assertEqual(replay_response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.replacement_password))
+
+    def test_enabling_mfa_requires_current_password(self):
+        self.client.force_login(self.user)
+
+        missing_password_response = self.client.post(
+            reverse("account_authenticator_setup"),
+            data={},
+            content_type="application/json",
+        )
+        valid_response = self.client.post(
+            reverse("account_authenticator_setup"),
+            data={"current_password": self.password},
+            content_type="application/json",
+        )
+
+        self.assertEqual(missing_password_response.status_code, 400)
+        self.assertEqual(valid_response.status_code, 200)
+        self.assertIn("otpauth_url", valid_response.json())
 
 
 class WeightedRoutingTests(TestCase):

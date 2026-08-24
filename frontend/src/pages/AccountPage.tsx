@@ -127,6 +127,7 @@ export default function AccountPage() {
   const [authenticatorOtpAuthUrl, setAuthenticatorOtpAuthUrl] = useState("");
   const [authenticatorQrCodeDataUrl, setAuthenticatorQrCodeDataUrl] = useState("");
   const [authenticatorOtp, setAuthenticatorOtp] = useState("");
+  const [authenticatorCurrentPassword, setAuthenticatorCurrentPassword] = useState("");
   const [startingAuthenticatorSetup, setStartingAuthenticatorSetup] = useState(false);
   const [verifyingAuthenticator, setVerifyingAuthenticator] = useState(false);
 
@@ -366,6 +367,11 @@ export default function AccountPage() {
   };
 
   const handleStartAuthenticatorSetup = async () => {
+    if (!authenticatorCurrentPassword) {
+      toast.error("Enter your current password to continue.");
+      return;
+    }
+
     try {
       setStartingAuthenticatorSetup(true);
 
@@ -376,7 +382,9 @@ export default function AccountPage() {
           "X-CSRFToken": getCsrfToken(),
         },
         credentials: "include",
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          current_password: authenticatorCurrentPassword,
+        }),
       });
       const data: AuthenticatorSetupResponse = await res.json();
 
@@ -386,6 +394,7 @@ export default function AccountPage() {
 
       setAuthenticatorOtpAuthUrl(data.otpauth_url || "");
       setAuthenticatorOtp("");
+      setAuthenticatorCurrentPassword("");
       toast.success(data.message || "Authenticator setup started.");
     } catch (error) {
       toast.error(
@@ -424,7 +433,7 @@ export default function AccountPage() {
       setAuthenticatorOtpAuthUrl("");
       setAuthenticatorQrCodeDataUrl("");
       setAuthenticatorOtp("");
-      toast.success(data.message || "Recovery authenticator enabled.");
+      toast.success(data.message || "Multi-factor authentication enabled.");
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to verify authenticator."
@@ -738,7 +747,7 @@ export default function AccountPage() {
               <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
                 <Smartphone className="h-5 w-5" />
               </div>
-              <CardTitle className="text-xl">Recovery Authenticator</CardTitle>
+              <CardTitle className="text-xl">Multi-factor Authentication</CardTitle>
             </div>
           </CardHeader>
           <CardContent className="space-y-5">
@@ -750,7 +759,7 @@ export default function AccountPage() {
                   </div>
                   <div className="space-y-3">
                     <p className="text-2xl font-semibold tracking-tight text-foreground">
-                      Recovery Authenticator
+                      Authenticator Protection
                     </p>
                     <div className="inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">
                       Enabled
@@ -760,6 +769,22 @@ export default function AccountPage() {
               </div>
             ) : (
               <>
+                <p className="text-sm leading-relaxed text-muted-foreground">
+                  Require your password and a rotating authenticator code when signing in.
+                </p>
+
+                <div className="space-y-2">
+                  <Label htmlFor="authenticator-current-password">Current Password</Label>
+                  <PasswordInput
+                    id="authenticator-current-password"
+                    value={authenticatorCurrentPassword}
+                    onChange={(event) => setAuthenticatorCurrentPassword(event.target.value)}
+                    placeholder="Confirm your password"
+                    autoComplete="current-password"
+                    disabled={startingAuthenticatorSetup || Boolean(authenticatorOtpAuthUrl)}
+                  />
+                </div>
+
                 <div className="flex flex-wrap items-center gap-3">
                   <div className="inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">
                     Not enabled
@@ -769,10 +794,14 @@ export default function AccountPage() {
                     type="button"
                     variant="outline"
                     onClick={() => void handleStartAuthenticatorSetup()}
-                    disabled={startingAuthenticatorSetup}
+                    disabled={
+                      startingAuthenticatorSetup ||
+                      !authenticatorCurrentPassword ||
+                      Boolean(authenticatorOtpAuthUrl)
+                    }
                     className="dark:border-white/10"
                   >
-                    {startingAuthenticatorSetup ? "Preparing..." : "Set Up Authenticator"}
+                    {startingAuthenticatorSetup ? "Preparing..." : "Set Up MFA"}
                   </Button>
                 </div>
 

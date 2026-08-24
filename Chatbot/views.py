@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import random
+import secrets
 import struct
 import time
 import uuid
@@ -14,7 +15,14 @@ from urllib.parse import quote
 from django.views.decorators.csrf import csrf_exempt
 
 from django.conf import settings
-from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.contrib.auth import (
+    authenticate,
+    get_user_model,
+    login,
+    logout,
+    update_session_auth_hash,
+)
+from django.contrib.auth.password_validation import validate_password
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core import signing
@@ -49,10 +57,15 @@ from .rollups import (
 
 AREA_CODES_CSV_PATH = settings.AREA_CODES_CSV_PATH
 url_validator = URLValidator()
-PASSWORD_RESET_SALT = "chatbot-forgot-password-v1"
-TOTP_ISSUER = "Portal"
+PASSWORD_RESET_SALT = "chatbot-forgot-password-v2"
+TOTP_ISSUER = "Pulsar Portal"
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_LOCKOUT_SECONDS = 3600
+ACCOUNT_AUTH_RATE_LIMIT_ATTEMPTS = 5
+ACCOUNT_AUTH_RATE_LIMIT_SECONDS = 900
+MFA_CHALLENGE_TTL_SECONDS = 300
+PASSWORD_RESET_TTL_SECONDS = 600
+MFA_SESSION_KEY = "pending_mfa_authentication"
 DASHBOARD_TABLE_CACHE_TTL_SECONDS = 30
 DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 120
 LIVE_DASHBOARD_ANALYTICS_CACHE_TTL_SECONDS = 5
@@ -113,28 +126,164 @@ def _generate_totp_code(secret, counter):
     return str(binary % 1_000_000).zfill(6)
 
 
-def _verify_totp_code(secret, otp, *, window=1, at_time=None):
+def _get_matching_totp_counter(secret, otp, *, window=1, at_time=None):
     normalized_otp = (otp or "").strip()
     if not normalized_otp.isdigit() or len(normalized_otp) != 6 or not secret:
-        return False
+        return None
 
     current_time = int(at_time or time.time())
     current_counter = current_time // 30
 
     for delta in range(-window, window + 1):
         if _generate_totp_code(secret, current_counter + delta) == normalized_otp:
-            return True
+            return current_counter + delta
 
-    return False
+    return None
+
+
+def _verify_totp_code(secret, otp, *, window=1, at_time=None):
+    return _get_matching_totp_counter(
+        secret,
+        otp,
+        window=window,
+        at_time=at_time,
+    ) is not None
+
+
+def _consume_totp_code(user_id, secret, otp, *, scope="authentication"):
+    matched_counter = _get_matching_totp_counter(secret, otp)
+    if matched_counter is None:
+        return False
+
+    replay_key = f"totp-used:{scope}:{user_id}:{matched_counter}"
+    return cache.add(replay_key, True, timeout=180)
+
+
+def _auth_subject_digest(value):
+    return hmac.new(
+        str(settings.SECRET_KEY).encode("utf-8"),
+        (value or "").strip().lower().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _auth_throttle_key(purpose, subject, kind):
+    return f"auth-throttle:{purpose}:{_auth_subject_digest(subject)}:{kind}"
+
+
+def _is_auth_subject_locked(purpose, subject):
+    if not subject:
+        return False
+    return bool(cache.get(_auth_throttle_key(purpose, subject, "locked")))
+
+
+def _record_auth_subject_failure(purpose, subject):
+    if not subject:
+        return
+
+    attempts_key = _auth_throttle_key(purpose, subject, "attempts")
+    if cache.add(attempts_key, 1, timeout=ACCOUNT_AUTH_RATE_LIMIT_SECONDS):
+        attempts = 1
+    else:
+        try:
+            attempts = cache.incr(attempts_key)
+        except ValueError:
+            cache.set(attempts_key, 1, timeout=ACCOUNT_AUTH_RATE_LIMIT_SECONDS)
+            attempts = 1
+
+    if attempts >= ACCOUNT_AUTH_RATE_LIMIT_ATTEMPTS:
+        cache.set(
+            _auth_throttle_key(purpose, subject, "locked"),
+            True,
+            timeout=ACCOUNT_AUTH_RATE_LIMIT_SECONDS,
+        )
+
+
+def _clear_auth_subject_failures(purpose, subject):
+    if not subject:
+        return
+    cache.delete_many(
+        [
+            _auth_throttle_key(purpose, subject, "attempts"),
+            _auth_throttle_key(purpose, subject, "locked"),
+        ]
+    )
+
+
+def _clear_mfa_challenge(request):
+    request.session.pop(MFA_SESSION_KEY, None)
+
+
+def _start_mfa_challenge(request, user):
+    request.session.cycle_key()
+    request.session[MFA_SESSION_KEY] = {
+        "user_id": user.pk,
+        "backend": getattr(
+            user,
+            "backend",
+            "django.contrib.auth.backends.ModelBackend",
+        ),
+        "expires_at": int(time.time()) + MFA_CHALLENGE_TTL_SECONDS,
+    }
+
+
+def _read_mfa_challenge(request):
+    challenge = request.session.get(MFA_SESSION_KEY)
+    if not isinstance(challenge, dict):
+        return None
+
+    if int(challenge.get("expires_at") or 0) < int(time.time()):
+        _clear_mfa_challenge(request)
+        return None
+
+    return challenge
+
+
+def _serialize_authenticated_user(user):
+    client = getattr(user, "client_profile", None)
+    return {
+        "id": user.id,
+        "username": user.get_username(),
+        "display_name": _get_user_display_name(user),
+        "email": user.email,
+        "mfa_enabled": _is_recovery_authenticator_enabled(client),
+        "recovery_authenticator_enabled": _is_recovery_authenticator_enabled(client),
+    }
 
 
 def _create_password_reset_token(user_id, email):
-    payload = {"user_id": user_id, "email": email}
+    nonce = secrets.token_urlsafe(32)
+    cache.set(
+        f"password-reset:{_auth_subject_digest(nonce)}",
+        user_id,
+        timeout=PASSWORD_RESET_TTL_SECONDS,
+    )
+    payload = {"user_id": user_id, "email": email, "nonce": nonce}
     return signing.dumps(payload, salt=PASSWORD_RESET_SALT)
 
 
-def _read_password_reset_token(token, *, max_age=600):
+def _read_password_reset_token(token, *, max_age=PASSWORD_RESET_TTL_SECONDS):
     return signing.loads(token, salt=PASSWORD_RESET_SALT, max_age=max_age)
+
+
+def _consume_password_reset_token(token_data):
+    nonce = token_data.get("nonce") or ""
+    if not nonce:
+        return False
+
+    nonce_key = f"password-reset:{_auth_subject_digest(nonce)}"
+    expected_user_id = cache.get(nonce_key)
+    if expected_user_id != token_data.get("user_id"):
+        return False
+
+    return bool(cache.delete(nonce_key))
+
+
+def _validate_new_password(password, user):
+    try:
+        validate_password(password, user=user)
+    except ValidationError as exc:
+        raise ValueError(" ".join(exc.messages)) from exc
 
 
 def _load_json_body(request):
@@ -568,23 +717,15 @@ def login_options_view(request):
     except ValueError as exc:
         return _json_error(str(exc), status=400)
 
-    user = _get_user_by_email(email)
-    if user is None:
-        return _json_error("No account was found for this email.", status=404)
-
-    if not user.is_active:
-        return _json_error("This account is inactive.", status=403)
-
-    client = getattr(user, "client_profile", None)
-    authenticator_enabled = _is_recovery_authenticator_enabled(client)
-
+    # Retained for rolling-deployment compatibility without exposing account state.
     return _json_response(
         {
-            "email": email,
-            "authenticator_enabled": authenticator_enabled,
+            "authenticator_enabled": False,
             "password_fallback_enabled": True,
+            "password_required": True,
         }
     )
+
 
 @require_POST
 def login_view(request):
@@ -599,75 +740,94 @@ def login_view(request):
     if lockout_error:
         return lockout_error
 
-    email = (payload.get("email") or "").strip().lower()
     password = payload.get("password") or ""
     otp = (payload.get("otp") or "").strip()
 
-    if not email:
-        return _json_error("Email is required.")
-
-    user_record = _get_user_by_email(email)
-    username = user_record.get_username() if user_record else email
-
     if otp:
-        if user_record is None:
+        challenge = _read_mfa_challenge(request)
+        if challenge is None:
             _record_failed_login_attempt(client_ip)
-            return _json_error("Invalid email or authenticator code.", status=401)
+            return _json_error("Invalid or expired verification code.", status=401)
 
-        if not user_record.is_active:
-            return _json_error("This account is inactive.", status=403)
+        user_record = (
+            get_user_model()
+            .objects.select_related("client_profile")
+            .filter(pk=challenge.get("user_id"), is_active=True)
+            .first()
+        )
+        account_subject = user_record.email if user_record else str(challenge.get("user_id"))
+        if _is_auth_subject_locked("login", account_subject):
+            return _json_error("Too many authentication attempts. Try again later.", status=429)
 
-        client = getattr(user_record, "client_profile", None)
-        if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
-            return _json_error("Authenticator login is not enabled for this account.", status=400)
+        client = getattr(user_record, "client_profile", None) if user_record else None
+        mfa_valid = bool(
+            user_record
+            and _is_recovery_authenticator_enabled(client)
+            and _consume_totp_code(user_record.pk, client.recovery_totp_secret, otp)
+        )
 
-        if not _verify_totp_code(client.recovery_totp_secret, otp):
+        if not mfa_valid:
             _record_failed_login_attempt(client_ip)
-            return _json_error("Invalid email or authenticator code.", status=401)
+            _record_auth_subject_failure("login", account_subject)
+            return _json_error("Invalid or expired verification code.", status=401)
 
-        login(request, user_record)
+        backend = challenge.get("backend") or "django.contrib.auth.backends.ModelBackend"
+        _clear_mfa_challenge(request)
+        login(request, user_record, backend=backend)
         _clear_failed_login_attempts(client_ip)
+        _clear_auth_subject_failures("login", account_subject)
 
         return _json_response(
             {
                 "message": "Login successful.",
-                "login_method": "otp",
-                "user": {
-                    "id": user_record.id,
-                    "username": user_record.get_username(),
-                    "display_name": _get_user_display_name(user_record),
-                    "email": user_record.email,
-                    "recovery_authenticator_enabled": True,
-                },
+                "login_method": "password_mfa",
+                "mfa_required": False,
+                "user": _serialize_authenticated_user(user_record),
             }
         )
 
-    if not password:
-        return _json_error("Password is required.")
+    _clear_mfa_challenge(request)
+
+    try:
+        email = _normalize_email(payload.get("email"), "email", required=True)
+    except ValueError:
+        return _json_error("Invalid email or password.", status=401)
+
+    if not password or _is_auth_subject_locked("login", email):
+        if _is_auth_subject_locked("login", email):
+            return _json_error("Too many authentication attempts. Try again later.", status=429)
+        return _json_error("Invalid email or password.", status=401)
+
+    user_record = _get_user_by_email(email)
+    username = user_record.get_username() if user_record else email
 
     user = authenticate(request, username=username, password=password)
     if user is None:
         _record_failed_login_attempt(client_ip)
+        _record_auth_subject_failure("login", email)
         return _json_error("Invalid email or password.", status=401)
 
-    if not user.is_active:
-        return _json_error("This account is inactive.", status=403)
+    client = getattr(user, "client_profile", None)
+    if _is_recovery_authenticator_enabled(client):
+        _start_mfa_challenge(request, user)
+        return _json_response(
+            {
+                "message": "Enter the code from your authenticator app.",
+                "mfa_required": True,
+                "challenge_expires_in": MFA_CHALLENGE_TTL_SECONDS,
+            }
+        )
 
     login(request, user)
     _clear_failed_login_attempts(client_ip)
-    client = getattr(user, "client_profile", None)
+    _clear_auth_subject_failures("login", email)
 
     return _json_response(
         {
             "message": "Login successful.",
             "login_method": "password",
-            "user": {
-                "id": user.id,
-                "username": user.get_username(),
-                "display_name": _get_user_display_name(user),
-                "email": user.email,
-                "recovery_authenticator_enabled": _is_recovery_authenticator_enabled(client),
-            },
+            "mfa_required": False,
+            "user": _serialize_authenticated_user(user),
         }
     )
 
@@ -789,8 +949,24 @@ def account_authenticator_setup_view(request):
     if error_response:
         return error_response
 
+    try:
+        payload = _load_json_body(request)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
     if client.recovery_totp_enabled and client.recovery_totp_secret:
-        return _json_error("Recovery authenticator is already enabled for this account.", status=400)
+        return _json_error("Multi-factor authentication is already enabled.", status=400)
+
+    current_password = payload.get("current_password") or ""
+    account_subject = client.user.email or str(client.user_id)
+    if _is_auth_subject_locked("mfa-setup", account_subject):
+        return _json_error("Too many verification attempts. Try again later.", status=429)
+
+    if not current_password or not client.user.check_password(current_password):
+        _record_auth_subject_failure("mfa-setup", account_subject)
+        return _json_error("Current password is incorrect.", status=400)
+
+    _clear_auth_subject_failures("mfa-setup", account_subject)
 
     secret = _generate_totp_secret()
     client.recovery_totp_secret = secret
@@ -800,7 +976,7 @@ def account_authenticator_setup_view(request):
     account_name = client.user.email or client.user.get_username()
     return _json_response(
         {
-            "message": "Recovery authenticator setup started.",
+            "message": "Multi-factor authentication setup started.",
             "setup_key": secret,
             "otpauth_url": _build_totp_uri(secret, account_name),
         }
@@ -822,13 +998,24 @@ def account_authenticator_verify_view(request):
     if not client.recovery_totp_secret:
         return _json_error("Authenticator setup has not been started.", status=400)
 
-    if not _verify_totp_code(client.recovery_totp_secret, otp):
+    account_subject = client.user.email or str(client.user_id)
+    if _is_auth_subject_locked("mfa-setup", account_subject):
+        return _json_error("Too many verification attempts. Try again later.", status=429)
+
+    if not _consume_totp_code(
+        client.user_id,
+        client.recovery_totp_secret,
+        otp,
+        scope="setup",
+    ):
+        _record_auth_subject_failure("mfa-setup", account_subject)
         return _json_error("Invalid authenticator code.", status=400)
 
     client.recovery_totp_enabled = True
     client.save(update_fields=["recovery_totp_enabled"])
+    _clear_auth_subject_failures("mfa-setup", account_subject)
 
-    return _json_response({"message": "Recovery authenticator enabled successfully."})
+    return _json_response({"message": "Multi-factor authentication enabled successfully."})
 
 
 @require_POST
@@ -855,15 +1042,17 @@ def account_password_view(request):
     if new_password != confirm_password:
         return _json_error("New password and confirmation do not match.", status=400)
 
-    if len(new_password) < 8:
-        return _json_error("New password must be at least 8 characters long.", status=400)
-
     if new_password == current_password:
         return _json_error("New password must be different from the current password.", status=400)
 
+    try:
+        _validate_new_password(new_password, client.user)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
     client.user.set_password(new_password)
     client.user.save(update_fields=["password"])
-    login(request, client.user)
+    update_session_auth_hash(request, client.user)
 
     return _json_response({"message": "Password updated successfully."})
 
@@ -880,17 +1069,19 @@ def forgot_password_start_view(request):
     except ValueError as exc:
         return _json_error(str(exc), status=400)
 
-    client = _get_client_by_email(email)
-    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
-        return _json_error(
-            "Recovery authenticator is not configured for this account.",
-            status=400,
-        )
+    client_ip = _get_client_ip(request)
+    if _is_auth_subject_locked("recovery", email) or _is_auth_subject_locked(
+        "recovery-ip",
+        client_ip,
+    ):
+        return _json_error("Too many recovery attempts. Try again later.", status=429)
 
     return _json_response(
         {
-            "message": "Enter the 6-digit code from your Google Authenticator app.",
-            "email": email,
+            "message": (
+                "If this account is eligible for authenticator recovery, "
+                "enter its current 6-digit code."
+            ),
         }
     )
 
@@ -908,17 +1099,34 @@ def forgot_password_verify_view(request):
         return _json_error(str(exc), status=400)
 
     otp = payload.get("otp") or ""
+    client_ip = _get_client_ip(request)
+    if _is_auth_subject_locked("recovery", email) or _is_auth_subject_locked(
+        "recovery-ip",
+        client_ip,
+    ):
+        return _json_error("Too many recovery attempts. Try again later.", status=429)
+
     client = _get_client_by_email(email)
-    if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
+    recovery_valid = bool(
+        client
+        and _is_recovery_authenticator_enabled(client)
+        and _consume_totp_code(
+            client.user_id,
+            client.recovery_totp_secret,
+            otp,
+        )
+    )
+    if not recovery_valid:
+        _record_auth_subject_failure("recovery", email)
+        _record_auth_subject_failure("recovery-ip", client_ip)
         return _json_error(
-            "Recovery authenticator is not configured for this account.",
+            "The recovery request is invalid or expired.",
             status=400,
         )
 
-    if not _verify_totp_code(client.recovery_totp_secret, otp):
-        return _json_error("Invalid authenticator code.", status=400)
-
     reset_token = _create_password_reset_token(client.user_id, client.user.email)
+    _clear_auth_subject_failures("recovery", email)
+    _clear_auth_subject_failures("recovery-ip", client_ip)
     return _json_response(
         {
             "message": "Authenticator code verified successfully.",
@@ -947,9 +1155,6 @@ def forgot_password_reset_view(request):
     if new_password != confirm_password:
         return _json_error("New password and confirmation do not match.", status=400)
 
-    if len(new_password) < 8:
-        return _json_error("New password must be at least 8 characters long.", status=400)
-
     try:
         token_data = _read_password_reset_token(reset_token)
     except signing.SignatureExpired:
@@ -966,8 +1171,21 @@ def forgot_password_reset_view(request):
     if client is None or not client.recovery_totp_enabled or not client.recovery_totp_secret:
         return _json_error("Recovery authenticator is not configured for this account.", status=400)
 
+    if user.check_password(new_password):
+        return _json_error("New password must be different from the current password.", status=400)
+
+    try:
+        _validate_new_password(new_password, user)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    if not _consume_password_reset_token(token_data):
+        return _json_error("Invalid or expired reset token.", status=400)
+
     user.set_password(new_password)
     user.save(update_fields=["password"])
+    logout(request)
+    _clear_auth_subject_failures("recovery", user.email)
 
     return _json_response({"message": "Password reset successful. You can now sign in."})
 

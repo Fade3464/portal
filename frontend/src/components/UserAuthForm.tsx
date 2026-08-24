@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowLeft, ArrowRight, KeyRound, LogIn, ShieldCheck } from "lucide-react";
+import { AlertCircle, ArrowLeft, ArrowRight, KeyRound, LogIn, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 
@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -23,19 +24,14 @@ import { SpinnerCustom } from "@/components/ui/spinner";
 import { getCsrfToken } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 
-type LoginOptionsResponse = {
-  status_code: number;
-  email?: string;
-  authenticator_enabled?: boolean;
-  password_fallback_enabled?: boolean;
-  error?: string;
-};
-
 type LoginResponse = {
   status_code: number;
   message?: string;
-  login_method?: "otp" | "password";
+  login_method?: "password" | "password_mfa";
+  mfa_required?: boolean;
+  challenge_expires_in?: number;
   user?: {
+    mfa_enabled?: boolean;
     recovery_authenticator_enabled?: boolean;
   };
   error?: string;
@@ -48,7 +44,7 @@ type ForgotPasswordResponse = {
   error?: string;
 };
 
-type LoginStep = "email" | "otp" | "password";
+type LoginStep = "credentials" | "otp";
 
 function getPasswordStrengthLabel(password: string) {
   if (!password) {
@@ -77,7 +73,7 @@ export function UserAuthForm({
   className,
   ...props
 }: React.HTMLAttributes<HTMLFormElement>) {
-  const [step, setStep] = React.useState<LoginStep>("email");
+  const [step, setStep] = React.useState<LoginStep>("credentials");
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [otp, setOtp] = React.useState("");
@@ -112,7 +108,7 @@ export function UserAuthForm({
   }
 
   const resetLoginState = React.useCallback(() => {
-    setStep("email");
+    setStep("credentials");
     setPassword("");
     setOtp("");
     setErrorMessage(null);
@@ -125,60 +121,13 @@ export function UserAuthForm({
       return;
     }
 
-    if (step === "email") {
-      await handleContinueWithEmail();
-      return;
-    }
-
     if (step === "otp" && otp.trim().length === 6) {
       await handleLogin("otp");
       return;
     }
 
-    if (step === "password" && password.trim()) {
+    if (step === "credentials" && email.trim() && password.trim()) {
       await handleLogin("password");
-    }
-  };
-
-  const handleContinueWithEmail = async () => {
-    if (!email.trim()) {
-      setErrorMessage("Please enter your email.");
-      return;
-    }
-
-    try {
-      setIsLoading(true);
-      setErrorMessage(null);
-      const csrfToken = await ensureCsrf();
-
-      const res = await fetch("/api/login/options/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRFToken": csrfToken,
-        },
-        credentials: "include",
-        body: JSON.stringify({
-          email,
-        }),
-      });
-      const result: LoginOptionsResponse = await res.json();
-
-      if (!res.ok) {
-        throw new Error(result.error || "Unable to continue.");
-      }
-
-      if (result.authenticator_enabled) {
-        setStep("otp");
-        setOtp("");
-      } else {
-        setStep("password");
-        setPassword("");
-      }
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Unable to continue.");
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -191,7 +140,6 @@ export function UserAuthForm({
       const payload =
         method === "otp"
           ? {
-              email,
               otp,
             }
           : {
@@ -215,12 +163,19 @@ export function UserAuthForm({
         throw new Error(result.error || "Login failed.");
       }
 
+      if (result.mfa_required) {
+        setStep("otp");
+        setPassword("");
+        setOtp("");
+        return;
+      }
+
       if (
         method === "password" &&
-        result.user?.recovery_authenticator_enabled === false
+        result.user?.mfa_enabled === false
       ) {
         toast.info(
-          "Enable Google Authenticator in Account to unlock faster sign-in and stronger recovery."
+          "Enable multi-factor authentication in Account for stronger sign-in protection."
         );
       }
 
@@ -364,32 +319,69 @@ export function UserAuthForm({
   return (
     <>
       <form
-        className={cn("grid w-full max-w-sm gap-4", className)}
+        className={cn("grid w-full gap-5", className)}
         onSubmit={(event) => void handleFormSubmit(event)}
         {...props}
       >
-        <div className="space-y-2">
-          <Label htmlFor="email">Email</Label>
-          <Input
-            id="email"
-            placeholder="name@example.com"
-            type="email"
-            autoComplete="username"
-            disabled={isLoading || step !== "email"}
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-          />
-        </div>
+        {step === "credentials" ? (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="email" className="text-sm font-medium">
+                Email address
+              </Label>
+              <Input
+                id="email"
+                placeholder="name@company.com"
+                type="email"
+                autoComplete="username"
+                autoFocus
+                disabled={isLoading}
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                className="h-11 rounded-lg bg-background/60 px-3.5"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-4">
+                <Label htmlFor="password" className="text-sm font-medium">
+                  Password
+                </Label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForgotPasswordOpen(true);
+                    setForgotEmail(email);
+                  }}
+                  className="rounded-sm text-xs font-medium text-primary underline-offset-4 transition-colors hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Forgot password?
+                </button>
+              </div>
+              <PasswordInput
+                id="password"
+                placeholder="Enter your password"
+                autoComplete="current-password"
+                disabled={isLoading}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="rounded-lg bg-background/60 [&_input]:h-11 [&_input]:rounded-lg [&_input]:px-3.5"
+              />
+            </div>
+          </>
+        ) : null}
 
         {step === "otp" ? (
-          <div className="space-y-4 rounded-2xl border border-border/70 bg-background/50 p-4 dark:border-white/10">
-            <div className="flex items-center gap-3">
-              <div className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                <ShieldCheck className="h-4 w-4" />
+          <div className="space-y-6">
+            <div className="flex items-start gap-3 rounded-xl border border-border/60 bg-muted/40 p-4">
+              <div className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <KeyRound className="h-4 w-4" />
               </div>
               <div>
-                <p className="text-sm font-medium">Authenticator</p>
-                <p className="text-xs text-muted-foreground">{email}</p>
+                <p className="text-sm font-semibold">Authenticator verification</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Enter the current six-digit code for <span className="font-medium text-foreground">{email}</span>.
+                </p>
               </div>
             </div>
 
@@ -402,8 +394,10 @@ export function UserAuthForm({
                 onChange={(value) => setOtp(value)}
                 disabled={isLoading}
                 pattern="^[0-9]+$"
+                autoComplete="one-time-code"
+                autoFocus
               >
-                <InputOTPGroup>
+                <InputOTPGroup className="w-full justify-between gap-1.5">
                   <InputOTPSlot index={0} />
                   <InputOTPSlot index={1} />
                   <InputOTPSlot index={2} />
@@ -414,20 +408,21 @@ export function UserAuthForm({
               </InputOTP>
             </div>
 
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center justify-between gap-3 pt-1">
               <Button
                 type="button"
                 variant="ghost"
-                className="px-2"
+                className="px-2 text-muted-foreground"
                 onClick={() => {
-                  setStep("password");
+                  setStep("credentials");
                   setPassword("");
+                  setOtp("");
                   setErrorMessage(null);
                 }}
                 disabled={isLoading}
               >
-                <KeyRound className="mr-2 h-4 w-4" />
-                Use password
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                Start over
               </Button>
 
               <Button
@@ -436,109 +431,75 @@ export function UserAuthForm({
                 disabled={isLoading || otp.trim().length !== 6}
               >
                 {isLoading ? <SpinnerCustom /> : <ShieldCheck className="mr-2 h-4 w-4" />}
-                Continue
+                Verify and continue
               </Button>
             </div>
           </div>
         ) : null}
 
-        {step === "password" ? (
-          <div className="space-y-4 rounded-2xl border border-border/70 bg-background/50 p-4 dark:border-white/10">
-            <div className="flex items-center gap-3">
-              <div className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                <KeyRound className="h-4 w-4" />
-              </div>
-              <div>
-                <p className="text-sm font-medium">Password</p>
-                <p className="text-xs text-muted-foreground">{email}</p>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="password">Password</Label>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setForgotPasswordOpen(true);
-                    setForgotEmail(email);
-                  }}
-                  className="text-xs font-medium text-primary transition-opacity hover:opacity-80"
-                >
-                  Forgot password?
-                </button>
-              </div>
-              <PasswordInput
-                id="password"
-                placeholder="********"
-                autoComplete="current-password"
-                disabled={isLoading}
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </div>
-
-            <div className="flex items-center justify-between gap-3">
-              <Button
-                type="button"
-                variant="ghost"
-                className="px-2"
-                onClick={() => {
-                  setStep("email");
-                  setPassword("");
-                  setErrorMessage(null);
-                }}
-                disabled={isLoading}
-              >
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                Change email
-              </Button>
-
-              <Button
-                type="button"
-                onClick={() => void handleLogin("password")}
-                disabled={isLoading || !password.trim()}
-              >
-                {isLoading ? <SpinnerCustom /> : <LogIn className="mr-2 h-4 w-4" />}
-                Sign in
-              </Button>
-            </div>
-          </div>
-        ) : null}
-
-        {step === "email" ? (
+        {step === "credentials" ? (
           <Button
-            type="button"
-            className="mt-3 h-11 w-full font-medium"
-            disabled={isLoading || !email.trim()}
-            onClick={() => void handleContinueWithEmail()}
+            type="submit"
+            className="mt-1 h-11 w-full rounded-lg font-semibold shadow-sm"
+            disabled={isLoading || !email.trim() || !password.trim()}
           >
-            {isLoading ? <SpinnerCustom /> : <ArrowRight className="mr-2 h-4 w-4" />}
-            Continue
+            {isLoading ? <SpinnerCustom /> : <LogIn className="mr-2 h-4 w-4" />}
+            Sign in
           </Button>
         ) : null}
 
         {errorMessage ? (
-          <p className="text-sm font-medium text-destructive">{errorMessage}</p>
+          <div
+            className="flex items-start gap-2.5 rounded-lg border border-destructive/25 bg-destructive/10 px-3.5 py-3 text-sm text-destructive"
+            role="alert"
+            aria-live="polite"
+          >
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <p className="leading-5">{errorMessage}</p>
+          </div>
         ) : null}
       </form>
 
       <Dialog open={forgotPasswordOpen} onOpenChange={handleForgotPasswordOpenChange}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Recover Account</DialogTitle>
+            <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <ShieldCheck className="h-5 w-5" />
+            </div>
+            <DialogTitle>Recover your account</DialogTitle>
+            <DialogDescription>
+              Verify your identity with the authenticator linked to your account.
+            </DialogDescription>
           </DialogHeader>
+
+          <div
+            className="flex items-center gap-2"
+            aria-label={`Recovery step ${forgotPasswordStep} of 3`}
+          >
+            {[1, 2, 3].map((stepNumber) => (
+              <span
+                key={stepNumber}
+                className={cn(
+                  "h-1 flex-1 rounded-full transition-colors",
+                  stepNumber <= forgotPasswordStep ? "bg-primary" : "bg-muted"
+                )}
+              />
+            ))}
+          </div>
 
           {forgotPasswordStep === 1 ? (
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="forgot-email">Original Email</Label>
+                <Label htmlFor="forgot-email">Account email</Label>
                 <Input
                   id="forgot-email"
                   type="email"
                   value={forgotEmail}
                   onChange={(event) => setForgotEmail(event.target.value)}
-                  placeholder="name@example.com"
+                  placeholder="name@company.com"
+                  autoComplete="username"
+                  autoFocus
+                  className="h-11"
                 />
               </div>
               <DialogFooter>
@@ -564,6 +525,8 @@ export function UserAuthForm({
                   value={forgotOtp}
                   onChange={(value) => setForgotOtp(value)}
                   pattern="^[0-9]+$"
+                  autoComplete="one-time-code"
+                  autoFocus
                 >
                   <InputOTPGroup>
                     <InputOTPSlot index={0} />
@@ -604,6 +567,8 @@ export function UserAuthForm({
                   value={newPassword}
                   onChange={(event) => setNewPassword(event.target.value)}
                   placeholder="Enter new password"
+                  autoComplete="new-password"
+                  className="[&_input]:h-11"
                 />
               </div>
 
@@ -620,6 +585,8 @@ export function UserAuthForm({
                   value={confirmNewPassword}
                   onChange={(event) => setConfirmNewPassword(event.target.value)}
                   placeholder="Confirm new password"
+                  autoComplete="new-password"
+                  className="[&_input]:h-11"
                 />
               </div>
 
